@@ -1,6 +1,6 @@
 {
   "name": "@electricmonkey/duo",
-  "version": "2.4.0",
+  "version": "2.6.0",
   "description": "Two coding agents, one plan: Codex and Claude plan, review and build in git worktrees \u2014 roles flippable, solo mode if you only have one",
   "bin": {
     "duo": "bin/duo"
@@ -35,5 +35,8 @@
   "bugs": "https://github.com/electric-monkey/duo/issues",
   "publishConfig": {
     "access": "public"
+  },
+  "scripts": {
+    "test": "bash test/run-checks.sh && bash test/e2e.sh"
   }
 }

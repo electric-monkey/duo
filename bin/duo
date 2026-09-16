@@ -13,18 +13,18 @@
 #  Requires: git, jq, claude, codex.  Works with macOS bash 3.2.
 # ─────────────────────────────────────────────────────────────────────────────
 set -o pipefail
-VERSION="2.4.0"
+VERSION="2.6.0"
 PKG="@electricmonkey/duo"
 
 # ── settings ────────────────────────────────────────────────────────────────
-KEYS="PLANNER IMPL ROUNDS MIN_CHANGE PARALLEL SPLIT SETUP TEST ENV_COPY PLAN_ONLY LENSES FIX_ROUNDS"
+KEYS="PLANNER IMPL ROUNDS MIN_CHANGE PARALLEL SPLIT SETUP TEST ENV_COPY PLAN_ONLY LENSES FIX_ROUNDS SOURCES"
 ENV_IMPL="${IMPL:-}"; ENV_MAX_ROUNDS="${MAX_ROUNDS:-}"
 ENV_SETUP_CMD="${SETUP_CMD:-}"; ENV_MAX_PARALLEL="${MAX_PARALLEL:-}"
 
 set_defaults() {
   PLANNER=codex; IMPL=claude; ROUNDS=3; MIN_CHANGE=5; PARALLEL=3; SPLIT=auto
   SETUP=auto; TEST=auto; ENV_COPY=on; PLAN_ONLY=off
-  LENSES=""; FIX_ROUNDS=1
+  LENSES=""; FIX_ROUNDS=1; SOURCES=""
 }
 
 CFG_DIR="$HOME/.config/duo"
@@ -66,8 +66,8 @@ env_overrides() {
 # ── look & feel ─────────────────────────────────────────────────────────────
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   TTY=1; ESC=$'\033'
-  RST="$ESC[0m"; BOLD="$ESC[1m"; DIM="$ESC[2m"; CLR="$ESC[K"
-  RED="$ESC[31m"; GRN="$ESC[32m"; YLW="$ESC[33m"; BLU="$ESC[34m"; MAG="$ESC[35m"; CYN="$ESC[36m"
+  RST="${ESC}[0m"; BOLD="${ESC}[1m"; DIM="${ESC}[2m"; CLR="${ESC}[K"
+  RED="${ESC}[31m"; GRN="${ESC}[32m"; YLW="${ESC}[33m"; BLU="${ESC}[34m"; MAG="${ESC}[35m"; CYN="${ESC}[36m"
 else
   TTY=0; ESC=""; RST=""; BOLD=""; DIM=""; CLR=""
   RED=""; GRN=""; YLW=""; BLU=""; MAG=""; CYN=""
@@ -80,6 +80,147 @@ fail() { printf '  %s✗%s %s\n' "$RED" "$RST" "$*"; }
 note() { printf '  %s%s%s\n' "$DIM" "$*" "$RST"; }
 bar()  { printf '  %s┃%s %s\n' "$MAG" "$RST" "$*"; }
 cols() { local c; c="$(tput cols 2>/dev/null)"; echo "${c:-80}"; }
+
+# ── text layout ─────────────────────────────────────────────────────────────
+BW=74
+PLAN_PREVIEW="${DUO_PLAN_PREVIEW:-40}"
+set_width() {
+  BW=$(( $(cols) - 6 ))
+  if (( BW < 40 )); then BW=40; fi
+  if (( BW > 110 )); then BW=110; fi
+}
+rep() { local i out=""; for ((i = 0; i < $2; i++)); do out="$out$1"; done; printf '%s' "$out"; }
+
+wrap_text() ( # width text → wrapped lines (word-aware, hard-breaks long words)
+  set -f
+  local w="$1" line="" word
+  if (( w < 10 )); then w=10; fi
+  for word in $2; do
+    if [[ -z "$line" ]]; then line="$word"
+    elif (( ${#line} + 1 + ${#word} <= w )); then line="$line $word"
+    else printf '%s\n' "$line"; line="$word"; fi
+    while (( ${#line} > w )); do printf '%s\n' "${line:0:w}"; line="${line:w}"; done
+  done
+  if [[ -n "$line" ]]; then printf '%s\n' "$line"; fi
+)
+
+inline_md() { # text style → **bold** and `code` styled
+  if (( ! TTY )); then
+    printf '%s' "$1" | sed -E 's/\*\*([^*]+)\*\*/\1/g; s/`([^`]+)`/\1/g'
+  else
+    printf '%s' "$1" | sed -E "s/\*\*([^*]+)\*\*/${BOLD}\1${RST}${2}/g; s/\`([^\`]+)\`/${CYN}\1${RST}${2}/g; s/\*\*//g"
+  fi
+}
+
+bar_wrap() { # indent prefix prefix-style text [text-style] [prefix-display]
+  local ind="$1" pre="$2" pst="$3" text="$4" style="${5:-}" shown="${6:-}" first=1 l pad hang
+  if [[ -z "$shown" ]]; then shown="$pst$pre$RST"; fi
+  pad="$(printf '%*s' "$ind" '')"
+  hang="$(printf '%*s' "${#pre}" '')"
+  while IFS= read -r l; do
+    if (( first )); then
+      printf '  %s┃%s %s%s%s%s%s\n' "$MAG" "$RST" "$pad" "$shown" "$style" "$(inline_md "$l" "$style")" "$RST"
+      first=0
+    else
+      printf '  %s┃%s %s%s%s%s%s\n' "$MAG" "$RST" "$pad" "$hang" "$style" "$(inline_md "$l" "$style")" "$RST"
+    fi
+  done < <(wrap_text $(( BW - ind - ${#pre} )) "$text")
+}
+
+section() { bar "${DIM}$(echo "$1" | tr '[:lower:]' '[:upper:]')${RST}${2:+  ${DIM}$2${RST}}"; }
+
+RE_BULLET='^([[:space:]]*)[-*+][[:space:]]+(.*)$'
+RE_NUMBER='^([[:space:]]*)([0-9]+[.)])[[:space:]]+(.*)$'
+RE_FENCE='^[[:space:]]*```'
+RE_TABLE_SEP='^[|: -]+$'
+
+md_render() { # markdown file → bar lines
+  local line in_code=0 prev_blank=1 ind cells
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ $RE_FENCE ]]; then in_code=$((1 - in_code)); continue; fi
+    if (( in_code )); then
+      bar "   ${DIM}${line:0:$((BW - 3))}${RST}"; prev_blank=0; continue
+    fi
+    if [[ -z "${line//[[:space:]]/}" ]]; then
+      if (( ! prev_blank )); then bar; fi
+      prev_blank=1; continue
+    fi
+    prev_blank=0
+    if [[ "$line" == "# "* ]]; then
+      bar_wrap 0 "" "" "${line#\# }" "$BOLD$MAG"
+    elif [[ "$line" == "## "* ]]; then
+      bar_wrap 0 "" "" "${line#\#\# }" "$BOLD"
+    elif [[ "$line" == "#"* ]]; then
+      bar_wrap 0 "" "" "$(echo "$line" | sed 's/^#* *//')" "$BOLD$DIM"
+    elif [[ "$line" =~ $RE_BULLET ]]; then
+      ind=${#BASH_REMATCH[1]}
+      bar_wrap $((ind + 1)) "• " "$CYN" "${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ $RE_NUMBER ]]; then
+      ind=${#BASH_REMATCH[1]}
+      bar_wrap $((ind + 1)) "${BASH_REMATCH[2]} " "$CYN" "${BASH_REMATCH[3]}"
+    elif [[ "$line" == ">"* ]]; then
+      bar_wrap 1 "│ " "$DIM" "${line#>}" "$DIM"
+    elif [[ "$line" == "|"* ]]; then
+      if [[ "$line" =~ $RE_TABLE_SEP ]]; then continue; fi
+      cells="$(echo "$line" | sed 's/^|//; s/|$//; s/|/ · /g')"
+      bar_wrap 1 "" "" "$cells" "$DIM"
+    else
+      bar_wrap 0 "" "" "$line"
+    fi
+  done < "$1"
+}
+
+score_color() {
+  case "$1" in
+    –|"") printf '%s' "$DIM" ;;
+    10|9*|8*) printf '%s' "$GRN" ;;
+    7*|6*|5*) printf '%s' "$YLW" ;;
+    *) printf '%s' "$RED" ;;
+  esac
+}
+score_bar() { # score → 10-cell bar + number (14 visible columns)
+  local s="$1" n c
+  if [[ -z "$s" || "$s" == – ]]; then printf '%s%s –  %s' "$DIM" "$(rep '·' 10)" "$RST"; return; fi
+  n="$(awk -v s="$s" 'BEGIN { printf "%d", s + 0.5 }')"
+  c="$(score_color "$s")"
+  printf '%s%s%s%s%s %s%-3s%s' "$c" "$(rep '█' "$n")" "$DIM" "$(rep '·' $((10 - n)))" "$RST" "$c" "$s" "$RST"
+}
+checks_cell() { # auto-json → "3✓ 1✗ 2–" padded to 10 columns
+  local p f k plain
+  if [[ -z "$1" || "$1" == "[]" || "$1" == null ]]; then printf '%s–%9s%s' "$DIM" "" "$RST"; return; fi
+  read -r p f k < <(echo "$1" | jq -r '"\([.[] | select(.result == "pass")] | length) \([.[] | select(.result == "fail")] | length) \([.[] | select(.result == "skip")] | length)"')
+  plain="${p}✓ ${f}✗ ${k}–"
+  printf '%s%s✓%s %s%s✗%s %s%s–%s%*s' "$GRN" "$p" "$RST" "$( ((f > 0)) && printf '%s' "$RED" || printf '%s' "$DIM")" "$f" "$RST" "$DIM" "$k" "$RST" $((10 - ${#plain})) ""
+}
+findings_cell() { # blocking should nit
+  local out=""
+  if (( $1 > 0 )); then out="${RED}● $1 blocking${RST}"; fi
+  if (( $2 > 0 )); then out="${out:+$out  }${YLW}○ $2 should${RST}"; fi
+  if (( $3 > 0 )); then out="${out:+$out  }${DIM}$3 nit${RST}"; fi
+  if (( BW < 70 )); then out="$(echo "$out" | sed 's/ blocking/ block/; s/ should/ shd/')"; fi
+  printf '%s' "${out:-${GRN}✓ clean${RST}}"
+}
+lens_header() {
+  if (( BW < 70 )); then bar "   ${DIM}$(printf '%-11s %-5s %-10s %s' review score checks findings)${RST}"
+  else bar "   ${DIM}$(printf '%-11s %-14s   %-10s %s' review score checks findings)${RST}"; fi
+}
+lens_row() { # name score auto-json blocking should nit
+  if (( BW < 70 )); then
+    local sc="$2"
+    if [[ -z "$sc" || "$sc" == – ]]; then sc="-"; fi
+    bar "   $(printf '%-11s' "$1") $(score_color "$2")$(printf '%-5s' "$sc")${RST} $(checks_cell "$3") $(findings_cell "$4" "$5" "$6")"
+  else
+    bar "   $(printf '%-11s' "$1") $(score_bar "$2")   $(checks_cell "$3") $(findings_cell "$4" "$5" "$6")"
+  fi
+}
+finding_lines() { # severity source claim evidence
+  local icon="${YLW}○${RST}" plain
+  if [[ "$1" == blocking ]]; then icon="${RED}●${RST}"; fi
+  if [[ "$1" == nit ]]; then icon="${DIM}·${RST}"; fi
+  plain="$(printf '* %-10s ' "$2")"
+  bar_wrap 3 "$plain" "" "$3" "" "$icon $(printf '%s%-10s%s ' "$DIM" "$2" "$RST")"
+  if [[ -n "$4" ]]; then bar_wrap $((3 + ${#plain})) "" "" "$4" "$DIM"; fi
+}
 fmt_t(){ printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
 other(){ if [[ "$1" == claude ]]; then echo codex; else echo claude; fi; }
 
@@ -89,7 +230,7 @@ step_line() { # icon label who seconds detail
 banner() {
   local c1="" c2="" c3="" roles
   resolve_roles
-  if (( TTY )); then c1="$ESC[38;5;213m"; c2="$ESC[38;5;141m"; c3="$ESC[38;5;81m"; fi
+  if (( TTY )); then c1="${ESC}[38;5;213m"; c2="${ESC}[38;5;141m"; c3="${ESC}[38;5;81m"; fi
   roles="$P_AGENT plans · $R_AGENT reviews · $B_AGENT builds"
   echo
   printf '  %s█▀▄ %s█ █ %s█▀█%s   %sduo%s %sv%s%s\n' "$c1" "$c2" "$c3" "$RST" "$BOLD" "$RST" "$DIM" "$VERSION" "$RST"
@@ -237,33 +378,245 @@ run_step() { # run_step <label> <who> <log> <prompt>; sets STEP_T
 }
 
 # ── lenses ──────────────────────────────────────────────────────────────────
-lens_dirs() {
-  echo "$(dirname "$(dirname "$(script_path)")")/lenses"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/duo"
+TRUST_FILE="$CFG_DIR/trusted"
+CHECK_TIMEOUT="${DUO_CHECK_TIMEOUT:-180}"
+
+builtin_lens_dir() { echo "$(dirname "$(dirname "$(script_path)")")/lenses"; }
+
+# lens sources (org / community repos pinned to a ref)
+source_dir() { echo "$CACHE_DIR/sources/$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
+source_url_ref() {
+  local spec="$1" tail="${1##*@}"
+  SRC_REF=""; SRC_URL="$spec"
+  if [[ "$spec" == *@* && "$tail" != */* && "$tail" != *:* ]]; then SRC_REF="$tail"; SRC_URL="${spec%@*}"; fi
+  case "$SRC_URL" in github:*) SRC_URL="https://github.com/${SRC_URL#github:}.git" ;; esac
+}
+fetch_source() {
+  local d tmp
+  d="$(source_dir "$1")"; source_url_ref "$1"
+  tmp="$d.tmp.$$"; rm -rf "$tmp"; mkdir -p "$(dirname "$d")"
+  if [[ -n "$SRC_REF" ]]; then
+    git clone -q --depth 1 --branch "$SRC_REF" "$SRC_URL" "$tmp" </dev/null >/dev/null 2>&1
+  else
+    git clone -q --depth 1 "$SRC_URL" "$tmp" </dev/null >/dev/null 2>&1
+  fi || { rm -rf "$tmp"; return 1; }
+  rm -rf "$d"; mv "$tmp" "$d"
+}
+source_lens_root() { local d; d="$(source_dir "$1")"; if [[ -d "$d/lenses" ]]; then echo "$d/lenses"; else echo "$d"; fi; }
+ensure_sources() {
+  local s
+  for s in $(echo "$SOURCES" | tr ',' ' '); do
+    if [[ ! -d "$(source_dir "$s")" ]]; then
+      if fetch_source "$s"; then ok "fetched lens source $s"; else warn "could not fetch lens source $s"; fi
+    fi
+  done
+}
+
+lens_dirs() { # lowest priority first
+  local s
+  builtin_lens_dir
+  for s in $(echo "$SOURCES" | tr ',' ' '); do source_lens_root "$s"; done
   echo "$CFG_DIR/lenses"
   echo "$ROOT/duo-lenses"
 }
-lens_file() { # later directories override earlier ones
+layer_name() {
+  local b; b="$(builtin_lens_dir)"
+  case "$1" in
+    "$b"/*) echo community ;;
+    "$CACHE_DIR"/*) echo source ;;
+    "$CFG_DIR"/*) echo personal ;;
+    *) echo project ;;
+  esac
+}
+lens_file() { # LENS.md from the highest layer that defines one
   local d f=""
   while read -r d; do
-    if [[ -f "$d/$1.md" ]]; then f="$d/$1.md"; fi
+    if [[ -f "$d/$1/LENS.md" ]]; then f="$d/$1/LENS.md"
+    elif [[ -f "$d/$1.md" ]]; then f="$d/$1.md"; fi
   done < <(lens_dirs)
   echo "$f"
 }
 lens_names() {
   local d f
   while read -r d; do
-    for f in "$d"/*.md; do
-      if [[ -f "$f" ]]; then basename "$f" .md; fi
+    for f in "$d"/*.md "$d"/*/LENS.md; do
+      [[ -f "$f" ]] || continue
+      if [[ "$(basename "$f")" == LENS.md ]]; then basename "$(dirname "$f")"; else basename "$f" .md; fi
     done
-  done < <(lens_dirs) | awk '!seen[$0]++'
+  done < <(lens_dirs) | grep -vE '^(README|CONTRIBUTING|CHANGELOG)$' | awk '!seen[$0]++'
 }
+
+# checks: executable files in <layer>/<lens>/checks/, merged across layers by file name
+check_meta() {
+  head -15 "$1" 2>/dev/null | grep -m1 -E '^[[:space:]]*(#|//|--)[[:space:]]*duo:' \
+    | grep -oE "(^|[[:space:]])$2=[^[:space:]]+" | head -1 | sed 's/.*=//'
+}
+check_desc() {
+  head -15 "$1" 2>/dev/null | grep -E '^[[:space:]]*(#|//)' | grep -vE 'duo:|^#!' | head -1 \
+    | sed -E 's/^[[:space:]]*(#|\/\/)[[:space:]]*//'
+}
+lens_checks() { # lens phase → files
+  local d f ph
+  while read -r d; do
+    for f in "$d/$1/checks/"*; do
+      [[ -f "$f" ]] || continue
+      ph="$(check_meta "$f" phase)"
+      [[ "${ph:-code}" == "$2" ]] || continue
+      printf '%s\t%s\n' "$(basename "$f")" "$f"
+    done
+  done < <(lens_dirs) | awk -F'\t' '{ if (!($1 in p)) k[++n] = $1; p[$1] = $2 } END { for (i = 1; i <= n; i++) print p[k[i]] }'
+}
+lens_check_count() { echo $(( $(lens_checks "$1" plan | grep -c .) + $(lens_checks "$1" code | grep -c .) )); }
+
+file_sha() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1; else sha256sum "$1" | cut -d' ' -f1; fi
+}
+is_trusted() {
+  case "$(layer_name "$1")" in community|personal) return 0 ;; esac
+  grep -qxF "$(file_sha "$1") $1" "$TRUST_FILE" 2>/dev/null
+}
+enabled_all() { local l; for l in $(echo "$LENSES" | tr ',' ' '); do if [[ -n "$(lens_file "$l")" ]]; then echo "$l"; fi; done; }
+untrusted_checks() {
+  local l ph f
+  for l in $(enabled_all); do
+    for ph in plan code; do
+      while read -r f; do
+        if [[ -n "$f" ]] && ! is_trusted "$f"; then echo "$f"; fi
+      done < <(lens_checks "$l" "$ph")
+    done
+  done | awk '!seen[$0]++'
+}
+ensure_trust() {
+  local list f key
+  list="$(untrusted_checks)"
+  if [[ -z "$list" ]]; then return 0; fi
+  echo
+  warn "these lens checks are not from duo itself and would run on your machine:"
+  while read -r f; do bar "$(layer_name "$f")  ${f#$ROOT/}  ${DIM}sha256 $(file_sha "$f" | cut -c1-12)${RST}"; done <<< "$list"
+  if (( ! TTY )) || [[ ! -t 0 ]]; then note "no terminal to approve them — they will be skipped"; return 0; fi
+  while :; do
+    printf '  %s›%s run them? %s[y]es, trust these versions · [v]iew · [n]o, skip them%s ' "$MAG" "$RST" "$DIM" "$RST"
+    trap ':' INT; read -rsn1 key || key=n; trap - INT; echo
+    case "$key" in
+      y|Y) mkdir -p "$CFG_DIR"
+           while read -r f; do echo "$(file_sha "$f") $f" >> "$TRUST_FILE"; done <<< "$list"
+           ok "trusted — duo asks again if any of them changes"; return 0 ;;
+      v|V) while read -r f; do printf '\n==> %s <==\n' "$f"; cat "$f"; done <<< "$list" | ${PAGER:-less -R} ;;
+      *)   note "skipping untrusted checks"; return 0 ;;
+    esac
+  done
+}
+
+check_runner() {
+  case "$1" in
+    *.sh) echo bash ;;
+    *.py) command -v python3 >/dev/null 2>&1 && echo python3 ;;
+    *.js|*.mjs|*.cjs) command -v node >/dev/null 2>&1 && echo node ;;
+    *.ts) command -v bun >/dev/null 2>&1 && echo bun ;;
+    *) [[ -x "$1" ]] && echo exec ;;
+  esac
+}
+
+run_checks() { # lens phase outfile — cwd and DUO_* env set by the caller
+  local lens="$1" phase="$2" out="$3" f name sev req runner rc pid i tmp result note iss
+  echo '[]' > "$out"
+  tmp="$(mktemp)"
+  while read -r f; do
+    [[ -n "$f" ]] || continue
+    name="$(basename "$f")"; name="${name%.*}"
+    sev="$(check_meta "$f" severity)"
+    case "$sev" in blocking|should|nit) ;; *) sev=should ;; esac
+    req="$(check_meta "$f" requires)"
+    result=skip; note=""; : > "$tmp"
+    runner="$(check_runner "$f")"
+    if ! is_trusted "$f"; then
+      note="not trusted — approve it when duo asks"
+    elif [[ "$req" == live ]]; then
+      note="needs a running app — live checks are not supported yet"
+    elif [[ -z "$runner" ]]; then
+      note="no runtime for $(basename "$f")"
+    else
+      if [[ "$runner" == exec ]]; then
+        DUO_LENS="$lens" DUO_CHECK="$name" "$f" > "$tmp" 2>&1 </dev/null &
+      else
+        DUO_LENS="$lens" DUO_CHECK="$name" $runner "$f" > "$tmp" 2>&1 </dev/null &
+      fi
+      pid=$!; i=0; rc=""
+      while kill -0 "$pid" 2>/dev/null; do
+        if (( i >= CHECK_TIMEOUT * 5 )); then kill_tree "$pid"; rc=124; break; fi
+        sleep 0.2; i=$((i + 1))
+      done
+      if [[ -z "$rc" ]]; then wait "$pid"; rc=$?; else wait "$pid" 2>/dev/null; fi
+      case "$rc" in
+        0)   result=pass ;;
+        1)   result=fail ;;
+        2)   note="$(grep -v '^::issue' "$tmp" | grep . | tail -1)" ;;
+        124) note="timed out after ${CHECK_TIMEOUT}s" ;;
+        *)   note="crashed (exit $rc): $(grep . "$tmp" | tail -1)" ;;
+      esac
+    fi
+    iss="$(grep '^::issue ' "$tmp" | head -50 \
+      | jq -R 'capture("^::issue file=(?<file>[^,]*),line=(?<line>[0-9]*)::(?<msg>.*)$")?' | jq -s '.')"
+    jq --arg n "$name" --arg s "$sev" --arg r "$result" --arg note "$note" \
+       --arg tail "$(grep -v '^::issue' "$tmp" | tail -15)" --arg desc "$(check_desc "$f")" \
+       --arg layer "$(layer_name "$f")" --argjson iss "${iss:-[]}" \
+       '. + [{name: $n, severity: $s, result: $r, note: $note, desc: $desc, layer: $layer, tail: $tail, issues: $iss}]' \
+       "$out" > "$out.tmp" && mv "$out.tmp" "$out"
+  done < <(lens_checks "$lens" "$phase")
+  rm -f "$tmp"
+}
+
+JQ_CHECK_ISSUES='def check_issues($l; $rr): [ $C[0][] | select(.result == "fail") | {
+    id: ($l + "-chk-" + .name),
+    severity: .severity,
+    claim: (if (.issues | length) > 0
+             then .name + ": " + .issues[0].msg + (if (.issues | length) > 1 then " (+\((.issues | length) - 1) more)" else "" end)
+             else "check " + .name + " failed" end),
+    evidence: (if (.issues | length) > 0 then ([.issues[:3][] | "\(.file):\(.line)"] | join(", "))
+               else ((.tail | split("\n") | map(select(length > 0)) | last) // "see check output") end),
+    reraised: $rr,
+    check: true } ];'
+
+merge_checks() { # review.json checks.json lens round
+  local rr=false
+  if (( $4 > 1 )); then rr=true; fi
+  jq --slurpfile C "$2" --arg l "$3" --argjson rr "$rr" "$JQ_CHECK_ISSUES"'
+    .auto = $C[0] | .issues = ((.issues // []) + check_issues($l; $rr))' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+merge_plan_checks() { # review.json checks.json lens round
+  local rr=false
+  if (( $4 > 1 )); then rr=true; fi
+  jq --slurpfile C "$2" --arg l "$3" --argjson rr "$rr" "$JQ_CHECK_ISSUES"'
+    (if ((.lenses // []) | map(.name) | index($l)) != null then . else .lenses = ((.lenses // []) + [{name: $l, checks: []}]) end)
+    | .lenses |= map(if .name == $l then .auto = $C[0] else . end)
+    | .issues = ((.issues // []) + (check_issues($l; $rr) | map(. + {lens: $l})))' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+checks_line() { # checks.json → "2✓ 1✗ 1–"
+  jq -r '"\([.[] | select(.result == "pass")] | length)✓ \([.[] | select(.result == "fail")] | length)✗ \([.[] | select(.result == "skip")] | length)–"' "$1" 2>/dev/null
+}
+
 lens_meta() { # file key
   awk -v k="$2" 'NR == 1 && $0 != "---" { exit }
     NR > 1 && $0 == "---" { exit }
     NR > 1 { i = index($0, ":"); if (substr($0, 1, i - 1) == k) { v = substr($0, i + 1); sub(/^ +/, "", v); print v; exit } }' "$1"
 }
 lens_body() { awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm' "$1"; }
-enabled_lenses() { # $1 = plan|code → enabled lens names for that phase
+lens_phase_ok() { # lens phase → does the lens's reviewer run in this phase?
+  local ph; ph="$(lens_meta "$(lens_file "$1")" phase)"
+  [[ "$ph" == both || "$ph" == "$2" ]]
+}
+checked_lenses() { # phase → enabled lenses with checks in that phase
+  local l; for l in $(enabled_all); do if [[ -n "$(lens_checks "$l" "$1")" ]]; then echo "$l"; fi; done
+}
+code_sources() { # enabled lenses that review or check code
+  local l
+  for l in $(enabled_all); do
+    if lens_phase_ok "$l" code || [[ -n "$(lens_checks "$l" code)" ]]; then echo "$l"; fi
+  done
+}
+
+enabled_lenses() { # $1 = plan|code → enabled lens names whose reviewer runs in that phase
   local l f ph
   for l in $(echo "$LENSES" | tr ',' ' '); do
     f="$(lens_file "$l")"
@@ -273,8 +626,8 @@ enabled_lenses() { # $1 = plan|code → enabled lens names for that phase
   done
 }
 
-JQ_SCORE='def score: ([.checks[]? | select(.result == "pass")] | length) as $p
-  | ([.checks[]? | select(.result == "fail")] | length) as $f
+JQ_SCORE='def score: ([(.checks[]?, .auto[]?) | select(.result == "pass")] | length) as $p
+  | ([(.checks[]?, .auto[]?) | select(.result == "fail")] | length) as $f
   | if ($p + $f) == 0 then "–" else ((($p * 100 / ($p + $f)) | round) / 10 | tostring) end;'
 
 color_score() { # "7.5" → colored
@@ -332,8 +685,8 @@ menu_draw() { # $1 = 1 on first draw
     f="$(lens_file "${M_NAMES[i]}")"
     if (( M_SEL[i] )); then mark="${GRN}◉${RST}"; else mark="${DIM}○${RST}"; fi
     if (( i == M_CUR )); then cur="${MAG}❯${RST}"; lbl="$BOLD${M_NAMES[i]}$RST"; else cur=" "; lbl="${M_NAMES[i]}"; fi
-    printf '\r%s  %s %s %s%*s %s%-5s %s%s\n' "$CLR" "$cur" "$mark" "$lbl" $((11 - ${#M_NAMES[i]})) "" \
-      "$DIM" "$(lens_meta "$f" phase)" "$(lens_meta "$f" summary)" "$RST"
+    printf '\r%s  %s %s %s%*s %s%-5s %-9s %s%s\n' "$CLR" "$cur" "$mark" "$lbl" $((11 - ${#M_NAMES[i]})) "" \
+      "$DIM" "$(lens_meta "$f" phase)" "${M_CHK[i]} checks" "$(lens_meta "$f" summary)" "$RST"
   done
   printf '\r%s\n' "$CLR"
   printf '\r%s  %ssettings%s\n' "$CLR" "$BOLD" "$RST"
@@ -387,6 +740,7 @@ lens_picker() { # interactive settings menu; returns 1 if cancelled
   M_NL=${#M_NAMES[@]}
   for ((i = 0; i < M_NL; i++)); do
     case ",$LENSES," in *",${M_NAMES[i]},"*) M_SEL[i]=1 ;; *) M_SEL[i]=0 ;; esac
+    M_CHK[i]="$(lens_check_count "${M_NAMES[i]}")"
   done
   M_SPLIT=0
   for ((i = 0; i < 3; i++)); do if [[ "${SPLITS[i]}" == "$SPLIT" ]]; then M_SPLIT=$i; fi; done
@@ -501,52 +855,74 @@ split_rule() {
 }
 
 # ── plan card (used by the gate and /show) ──────────────────────────────────
-plan_card() {
-  local run="$1" st rounds last par US=$'\x1f'
+plan_card() { # run-dir [gate]
+  local run="$1" gate="${2:-}" st rounds last par US=$'\x1f' rendered total id c e n t f
+  set_width
   st="$(cut -d: -f1 "$run/loop" 2>/dev/null)"
   rounds="$(cut -d: -f2 "$run/loop" 2>/dev/null)"
   last="$(cat "$run/last_review" 2>/dev/null)"
   par="$(cat "$run/split" 2>/dev/null)"
   echo
-  bar "${BOLD}$(jq -r '.summary' "$run/plan.json")${RST}"
+  bar_wrap 0 "" "" "$(jq -r '.summary' "$run/plan.json")" "$BOLD"
   bar
   case "$st" in
-    converged) bar "${GRN}✓ converged${RST} after $rounds round(s) — no blocking issues" ;;
-    stalled)   bar "${YLW}! stalled${RST} after $rounds round(s) — revisions were cosmetic" ;;
-    deadlock)  bar "${YLW}! deadlock${RST} — planner rejected, reviewer insists: $(cat "$run/dead" 2>/dev/null)" ;;
-    cap)       bar "${RED}✗ round cap${RST} hit after $rounds round(s) with blockers left" ;;
+    converged) bar "${GRN}✓ converged${RST} after $rounds round(s) · no blocking issues" ;;
+    stalled)   bar "${YLW}! stalled${RST} after $rounds round(s) · revisions stopped changing the plan" ;;
+    deadlock)  bar "${YLW}! deadlock${RST} · planner rejected, reviewer insists: $(cat "$run/dead" 2>/dev/null)" ;;
+    cap)       bar "${RED}✗ round cap${RST} · $rounds round(s) used, blockers left" ;;
   esac
   if [[ "$st" != converged && -f "$last" ]]; then
-    jq -r '.issues[] | select(.severity == "blocking") | "\(.id)\u001f\(.claim)"' "$last" |
-      while IFS="$US" read -r id c; do bar "  ${RED}●${RST} $id ${DIM}$c${RST}"; done
-  fi
-  if [[ -f "$last" ]] && jq -e '(.lenses // []) | length > 0' "$last" >/dev/null 2>&1; then
-    local lline=""
-    while IFS=$'\x1f' read -r ln sc nb; do
-      lline="$lline$ln $(color_score "$sc")"
-      if (( nb > 0 )); then lline="$lline ${RED}●$nb${RST}"; fi
-      lline="$lline   "
-    done < <(jq -r "$JQ_SCORE"' . as $r | .lenses[] | .name as $n
-      | "\($n)\u001f\(score)\u001f\([$r.issues[] | select(.lens == $n and .severity == "blocking")] | length)"' "$last")
-    bar "${DIM}lenses${RST}  $lline"
+    while IFS="$US" read -r id c e; do
+      finding_lines blocking "$id" "$c" "$e"
+    done < <(jq -r '.issues[] | select(.severity == "blocking") | "\(.id)\u001f\(.claim)\u001f\(.evidence // "")"' "$last")
   fi
   if [[ "$par" == true ]]; then
-    bar "${CYN}⇉ parallel${RST} ${DIM}$(jq -r '.reason' "$run/plan.json")${RST}"
+    bar_wrap 0 "⇉ parallel  " "$CYN" "$(jq -r '.reason' "$run/plan.json")" "$DIM"
     bar "  $(parallel_estimate "$(jq '.tasks | length' "$run/plan.json")")"
   else
-    bar "${BLU}→ serial${RST}   ${DIM}$(jq -r '.reason' "$run/plan.json")${RST}"
+    bar_wrap 0 "→ serial  " "$BLU" "$(jq -r '.reason' "$run/plan.json")" "$DIM"
   fi
   if [[ -s "$run/dupes" ]]; then
-    bar "${YLW}! planner wanted parallel, but tasks share:${RST} $(tr '\n' ' ' < "$run/dupes")"
+    bar_wrap 0 "! " "$YLW" "planner wanted parallel, but tasks share: $(tr '\n' ' ' < "$run/dupes")"
   fi
+
   bar
-  jq -r '.tasks | to_entries[] | "\(.key + 1)\u001f\(.value.id)\u001f\(.value.title)\u001f\(.value.files | join(", "))"' "$run/plan.json" |
-    while IFS="$US" read -r n id t f; do
-      bar "${BOLD}$n.${RST} $t ${DIM}· $id${RST}"
-      bar "   ${DIM}$f${RST}"
-    done
+  section tasks
+  while IFS="$US" read -r n id t f; do
+    bar_wrap 1 "$n  " "$BOLD" "$t" "$BOLD"
+    bar_wrap $((3 + ${#n})) "" "" "$id · $f" "$DIM"
+  done < <(jq -r '.tasks | to_entries[] | "\(.key + 1)\u001f\(.value.id)\u001f\(.value.title)\u001f\(.value.files | join(" · "))"' "$run/plan.json")
+
+  if [[ -f "$last" ]]; then
+    bar
+    section review
+    lens_header
+    while IFS="$US" read -r n sc au b sh ni; do
+      lens_row "$n" "$sc" "$au" "$b" "$sh" "$ni"
+    done < <(jq -r "$JQ_SCORE"' . as $r
+      | ([(.lenses // [])[].name]) as $names
+      | (["review"] + $names)[] as $n
+      | ([($r.lenses // [])[] | select(.name == $n)] | .[0]) as $l
+      | [ $n,
+          (if $l then ($l | score) else "–" end),
+          (if $l and (($l.auto // []) | length > 0) then ($l.auto | tojson) else "" end),
+          ([$r.issues[] | select(((.lens // "general") | if . == "general" then "review" else . end) == $n and .severity == "blocking")] | length),
+          ([$r.issues[] | select(((.lens // "general") | if . == "general" then "review" else . end) == $n and .severity == "should")] | length),
+          ([$r.issues[] | select(((.lens // "general") | if . == "general" then "review" else . end) == $n and .severity == "nit")] | length)
+        ] | map(tostring) | join("\u001f")' "$last")
+  fi
+
   bar
-  bar "${DIM}${run#$ROOT/}/PLAN.md${RST}"
+  section plan "${run#$ROOT/}/PLAN.md"
+  rendered="$(md_render "$run/PLAN.md")"
+  total="$(printf '%s\n' "$rendered" | wc -l | tr -d ' ')"
+  if (( total > PLAN_PREVIEW )); then
+    printf '%s\n' "$rendered" | head -n "$PLAN_PREVIEW"
+    if [[ -n "$gate" ]]; then bar "${DIM}… $((total - PLAN_PREVIEW)) more lines · press p to read the whole plan${RST}"
+    else bar "${DIM}… $((total - PLAN_PREVIEW)) more lines in PLAN.md${RST}"; fi
+  else
+    printf '%s\n' "$rendered"
+  fi
 }
 
 avg_task_secs() { # average task duration from earlier runs in this repo
@@ -586,17 +962,21 @@ split_check() { # decides final serial/parallel for $RUN
 gate() {
   local key
   while :; do
-    plan_card "$RUN"
+    plan_card "$RUN" gate
     if [[ "$PLAN_ONLY" == on ]]; then note "plan-only mode — stopping here (/planonly off to build)"; return 1; fi
-    printf '\n  %s›%s build with %s%s%s, review by %s? %s[y]es · [p]lan · [e]dit · [n]o%s ' \
-      "$MAG" "$RST" "$BOLD" "$B_AGENT" "$RST" "$REVIEWER" "$DIM" "$RST"
+    if (( $(cols) < 80 )); then
+      printf '\n  %s›%s build? %s[y]es [p]lan [e]dit [n]o%s ' "$MAG" "$RST" "$DIM" "$RST"
+    else
+      printf '\n  %s›%s build with %s%s%s, review by %s? %s[y]es · [p]lan · [e]dit · [n]o%s ' \
+        "$MAG" "$RST" "$BOLD" "$B_AGENT" "$RST" "$REVIEWER" "$DIM" "$RST"
+    fi
     trap ':' INT
     read -rsn1 key || key=n
     trap - INT
     echo
     case "$key" in
       y|Y) return 0 ;;
-      p|P) ${PAGER:-less -R} "$RUN/PLAN.md" ;;
+      p|P) set_width; md_render "$RUN/PLAN.md" | ${PAGER:-less -R} ;;
       e|E) ${EDITOR:-nano} "$RUN/PLAN.md" "$RUN/plan.json"
            if jq -e '.tasks | length > 0' "$RUN/plan.json" >/dev/null 2>&1; then
              split_check; ok "plan updated"
@@ -640,6 +1020,10 @@ $NO_CODE"
     f="$(lens_file "$1")"
     printf '%s\n' "You are reviewing a code change as: $(lens_meta "$f" title).
 
+Automated checks for this lens already ran; results are in .duo-checks-$1.json
+(pass/fail/skip with output). Failed checks are added as findings automatically —
+do not repeat them, but use them as evidence.
+
 $(lens_body "$f")
 
 Review the diff in .duo-diff.patch against the task in .duo-task.md and the
@@ -669,12 +1053,31 @@ commit_work() { # id message → 0 if something was committed
   if [[ -n "$COPIED" ]]; then git reset -q -- $COPIED 2>/dev/null; fi
   git commit -qm "$2" >/dev/null 2>&1
 }
-
 review_round() { # id round sources
   local id="$1" r="$2" src
+  git diff --name-only "$BASE...HEAD" > .duo-changed.txt
+  if [[ -n "$(echo $3 | tr ' ' '\n' | grep -v '^code$')" ]]; then setst "$id" checking; mark "$id" check; fi
+  for src in $3; do
+    [[ "$src" == code ]] && continue
+    ( export DUO_PHASE=code DUO_ROOT="$PWD" DUO_BASE="$BASE" DUO_DIFF="$PWD/.duo-diff.patch" \
+             DUO_CHANGED_FILES="$PWD/.duo-changed.txt" DUO_TASK="$PWD/.duo-task.md" \
+             DUO_TASK_FILES="$PWD/.duo-task-files.txt" DUO_PLAN="$PWD/.duo-plan.md" \
+             DUO_PLAN_JSON="$PWD/.duo-plan.json" DUO_LIB="$(builtin_lens_dir)/_lib" \
+             DUO_PM="$(pkg_manager)" DUO_TEST_CMD="$TEST_CMD_R"
+      run_checks "$src" code ".duo-checks-$src.json" )
+    cp ".duo-checks-$src.json" "$RUN/checks-$id-$src-r$r.json"
+  done
+  setst "$id" reviewing; mark "$id" review
   for src in $3; do
     rm -f ".duo-review-$src.json"
-    ( agent "$REVIEWER" "$(review_prompt "$src" "$r")" > "$RUN/review-$id-$src-r$r.log" 2>&1
+    ( if [[ "$src" == code ]] || lens_phase_ok "$src" code; then
+        agent "$REVIEWER" "$(review_prompt "$src" "$r")" > "$RUN/review-$id-$src-r$r.log" 2>&1
+      else
+        printf '{"lens":"%s","checks":[],"issues":[]}\n' "$src" > ".duo-review-$src.json"
+      fi
+      if [[ "$src" != code ]] && jq -e '.issues' ".duo-review-$src.json" >/dev/null 2>&1; then
+        merge_checks ".duo-review-$src.json" ".duo-checks-$src.json" "$src" "$r"
+      fi
       if jq -e '.issues' ".duo-review-$src.json" >/dev/null 2>&1; then
         cp ".duo-review-$src.json" "$RUN/review-$id-$src-r$r.json"
       fi ) &
@@ -725,7 +1128,6 @@ work() {
   echo '[]' > .duo-fixlog.json
   sources="$ALL_SOURCES"
   while :; do
-    setst "$id" reviewing; mark "$id" review
     git diff "$BASE...HEAD" > .duo-diff.patch
     review_round "$id" "$r" "$sources"
     collect_blockers
@@ -743,6 +1145,8 @@ Context: the task is in .duo-task.md and the plan in .duo-plan.md. $TNOTE
 Change only what each finding requires; do not refactor or widen scope.
 For EACH finding append one entry to the JSON array in .duo-fixlog.json:
 {\"id\":\"<finding id>\",\"decision\":\"fixed|rejected\",\"reason\":\"one line\",\"round\":$fixr}
+Findings with \"check\": true come from automated checks; their full output is in
+.duo-checks-<lens>.json and they are re-run after your fix.
 Reject only with a concrete, checkable reason. Keep .duo-fixlog.json valid JSON.
 Do not commit." > "$RUN/fix-$id-r$fixr.log" 2>&1
     if ! jq -e 'type == "array"' .duo-fixlog.json >/dev/null 2>&1; then echo '[]' > .duo-fixlog.json; fi
@@ -761,6 +1165,7 @@ Do not commit." > "$RUN/fix-$id-r$fixr.log" 2>&1
 }
 
 BAR_W=20
+BOARD_COLS=80
 task_first() { head -1 "$1" 2>/dev/null | cut -d' ' -f2; }
 task_end()   { awk '$1 == "end" { print $2 }' "$1" 2>/dev/null | tail -1; }
 task_setup() { awk '$1 == "setup" { s = $2 } $1 == "build" && s { print $2 - s; exit }' "$1" 2>/dev/null; }
@@ -800,7 +1205,7 @@ timeline() { # $1 = times file, $2 = board start, $3 = span → colored bar
     case "$ph" in
       setup)  out="$out${DIM}░${RST}" ;;
       build)  out="$out${CYN}█${RST}" ;;
-      test)   out="$out${YLW}█${RST}" ;;
+      test|check) out="$out${YLW}█${RST}" ;;
       review) out="$out${MAG}█${RST}" ;;
       fix)    out="$out${BLU}█${RST}" ;;
       *)      out="$out${DIM}·${RST}" ;;
@@ -808,9 +1213,17 @@ timeline() { # $1 = times file, $2 = board start, $3 = span → colored bar
   done
   printf '%s' "$out"
 }
+board_layout() { # sets BAR_W (timeline width, 0 = hidden) from the terminal width
+  local c; c="$(cols)"
+  BAR_W=$(( c - 56 ))
+  if (( BAR_W > 30 )); then BAR_W=30; fi
+  if (( BAR_W < 8 )); then BAR_W=0; fi
+  BOARD_COLS="$c"
+}
 
 draw_board() { # $1 = frame, $2 = 1 on first draw, $3 = 1 when final
-  local id st icon el a e now tend span running=0 queued=0 hline f n
+  local id st icon el a e now tend span running=0 queued=0 f n tl_h="" tl_t="" line foot
+  board_layout
   now="$(date +%s)"; tend="$now"
   n="$(wc -l < "$RUN/ids" | tr -d ' ')"
   if [[ "$3" == 1 ]]; then
@@ -820,47 +1233,55 @@ draw_board() { # $1 = frame, $2 = 1 on first draw, $3 = 1 when final
   span=$((tend - BOARD_T0)); if (( span < 1 )); then span=1; fi
   if [[ "$2" != 1 ]] && (( TTY )); then printf '%s[%sA' "$ESC" "$BOARD_LINES"; fi
 
-  hline="$(printf '─%.0s' $(seq 1 24))"
-  printf '\r%s  %s┌%s┬────────────┬─────────┬──────────────────────┐%s\n' "$CLR" "$DIM" "$hline" "$RST"
-  printf '\r%s  %s│%s %-22s %s│%s %-10s %s│%s %7s %s│%s %-20s %s│%s\n' "$CLR" "$DIM" "$RST$BOLD" "task" "$RST$DIM" "$RST$BOLD" "state" "$RST$DIM" "$RST$BOLD" "time" "$RST$DIM" "$RST$BOLD" "timeline" "$RST$DIM" "$RST"
-  printf '\r%s  %s├%s┼────────────┼─────────┼──────────────────────┤%s\n' "$CLR" "$DIM" "$hline" "$RST"
+  if (( BAR_W > 0 )); then
+    tl_h="┬$(rep '─' $((BAR_W + 2)))"; tl_t="┴$(rep '─' $((BAR_W + 2)))"
+  fi
+  printf '\r%s  %s┌%s┬%s┬%s%s┐%s\n' "$CLR" "$DIM" "$(rep '─' 24)" "$(rep '─' 12)" "$(rep '─' 9)" "$tl_h" "$RST"
+  line="$(printf '│ %-22s │ %-10s │ %7s │' task state time)"
+  if (( BAR_W > 0 )); then line="$line$(printf ' %-*s │' "$BAR_W" timeline)"; fi
+  printf '\r%s  %s%s%s\n' "$CLR" "$DIM" "$line" "$RST"
+  printf '\r%s  %s├%s┼%s┼%s%s┤%s\n' "$CLR" "$DIM" "$(rep '─' 24)" "$(rep '─' 12)" "$(rep '─' 9)" "${tl_h:+┼${tl_h#┬}}" "$RST"
   while read -r id; do
     f="$RUN/times-$id"
     st="$(cat "$RUN/state-$id" 2>/dev/null || echo queued)"
     case "$st" in
-      queued)         icon="${DIM}·${RST}"; queued=$((queued + 1)) ;;
-      setup|building) icon="${CYN}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
-      testing)        icon="${YLW}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
-      reviewing)      icon="${MAG}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
-      fixing)         icon="${BLU}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
-      done)           icon="${GRN}✓${RST}" ;;
-      blocked)        icon="${RED}●${RST}" ;;
-      *)              icon="${RED}✗${RST}" ;;
+      queued)           icon="${DIM}·${RST}"; queued=$((queued + 1)) ;;
+      setup|building)   icon="${CYN}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
+      testing|checking) icon="${YLW}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
+      reviewing)        icon="${MAG}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
+      fixing)           icon="${BLU}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
+      done)             icon="${GRN}✓${RST}" ;;
+      blocked)          icon="${RED}●${RST}" ;;
+      *)                icon="${RED}✗${RST}" ;;
     esac
     el=""
     a="$(task_first "$f")"
     if [[ -n "$a" ]]; then e="$(task_end "$f")"; el="$(fmt_t $(( ${e:-$now} - a )))"; fi
-    printf '\r%s  %s│%s %s %-20s %s│%s %-10s %s│%s %7s %s│%s %s %s│%s\n' "$CLR" "$DIM" "$RST" "$icon" "${id:0:20}" \
-      "$DIM" "$RST" "${st:0:10}" "$DIM" "$RST" "$el" "$DIM" "$RST" "$(timeline "$f" "$BOARD_T0" "$span")" "$DIM" "$RST"
+    printf '\r%s  %s│%s %s %-20s %s│%s %-10s %s│%s %7s %s│%s' "$CLR" "$DIM" "$RST" "$icon" "${id:0:20}" \
+      "$DIM" "$RST" "${st:0:10}" "$DIM" "$RST" "$el" "$DIM" "$RST"
+    if (( BAR_W > 0 )); then printf ' %s %s│%s' "$(timeline "$f" "$BOARD_T0" "$span")" "$DIM" "$RST"; fi
+    printf '\n'
   done < "$RUN/ids"
-  printf '\r%s  %s└%s┴────────────┴─────────┴──────────────────────┘%s\n' "$CLR" "$DIM" "$hline" "$RST"
+  printf '\r%s  %s└%s┴%s┴%s%s┘%s\n' "$CLR" "$DIM" "$(rep '─' 24)" "$(rep '─' 12)" "$(rep '─' 9)" "$tl_t" "$RST"
 
   if [[ "$3" == 1 ]]; then
     timing_stats "$RUN"
     if (( n > 1 && T_WALL > 0 && T_EST > T_WALL )); then
       echo "$n tasks in parallel · wall $(fmt_t "$T_WALL") · serial est. $(fmt_t "$T_EST") · saved ~$(fmt_t $((T_EST - T_WALL))) ($(ratio "$T_EST" "$T_WALL") faster)" > "$RUN/timing"
-    else
-      echo "$n task(s) · wall $(fmt_t "$T_WALL")" > "$RUN/timing"
-    fi
-    if (( n > 1 && T_WALL > 0 && T_EST > T_WALL )); then
-      printf '\r%s  %s⇉%s %s tasks · wall %s%s%s · serial est. %s · saved %s~%s%s %s(%s faster)%s\n' "$CLR" "$CYN" "$RST" "$n" \
+      printf '\r%s  %s⇉%s %s tasks · wall %s%s%s · serial est. %s · saved %s~%s%s %s(%s)%s\n' "$CLR" "$CYN" "$RST" "$n" \
         "$BOLD" "$(fmt_t "$T_WALL")" "$RST" "$(fmt_t "$T_EST")" "$GRN$BOLD" "$(fmt_t $((T_EST - T_WALL)))" "$RST" "$DIM" "$(ratio "$T_EST" "$T_WALL")" "$RST"
     else
+      echo "$n task(s) · wall $(fmt_t "$T_WALL")" > "$RUN/timing"
       printf '\r%s  %s→%s %s task(s) · wall %s%s%s\n' "$CLR" "$BLU" "$RST" "$n" "$BOLD" "$(fmt_t "$T_WALL")" "$RST"
     fi
   else
-    printf '\r%s  %swall %s · %s running · %s queued     %s░ setup %s█ build %s█ test %s█ review %s█ fix%s\n' "$CLR" "$DIM" \
-      "$(fmt_t $((now - BOARD_T0)))" "$running" "$queued" "$RST$DIM" "$CYN" "$YLW" "$MAG" "$BLU" "$RST"
+    foot="wall $(fmt_t $((now - BOARD_T0))) · $running running · $queued queued"
+    if (( BAR_W > 0 && BOARD_COLS >= 90 )); then
+      printf '\r%s  %s%s     ░ setup %s█ build %s█ test/checks %s█ review %s█ fix%s\n' "$CLR" "$DIM" "$foot" \
+        "$CYN" "$YLW" "$MAG" "$BLU" "$RST"
+    else
+      printf '\r%s  %s%s%s\n' "$CLR" "$DIM" "${foot:0:$((BOARD_COLS - 3))}" "$RST"
+    fi
   fi
 }
 
@@ -878,17 +1299,24 @@ implement() {
   fi
 
   SETUP_CMD_R="$(resolve_setup)"; TEST_CMD_R="$(resolve_test)"
-  ALL_SOURCES="code $(enabled_lenses code | tr '\n' ' ')"
+  ALL_SOURCES="code $(code_sources | tr '\n' ' ')"
   echo "$ALL_SOURCES" > "$RUN/sources"
   echo
-  note "setup: ${SETUP_CMD_R:-none} · tests: ${TEST_CMD_R:-none} · reviews: $(echo $ALL_SOURCES | tr ' ' ',') · fix rounds: $FIX_ROUNDS · parallel: $PARALLEL"
+  set_width
+  while IFS= read -r _l; do note "$_l"; done < <(wrap_text "$BW" "setup: ${SETUP_CMD_R:-none} · tests: ${TEST_CMD_R:-none} · reviews: $(echo $ALL_SOURCES | tr ' ' ',') · fix rounds: $FIX_ROUNDS · parallel: $PARALLEL")
   while read -r id; do
     wt="$(wt_path "$id")"
     if ! git worktree add -q -b "$(branch "$id")" "$wt" "$BASE" 2>"$RUN/worktree-$id.log"; then
       fail "could not create worktree for $id — see ${RUN#$ROOT/}/worktree-$id.log"; return 1
     fi
     cp "$RUN/PLAN.md" "$wt/.duo-plan.md"
+    cp "$RUN/plan.json" "$wt/.duo-plan.json"
     cp "$RUN/task-$id.md" "$wt/.duo-task.md"
+    if [[ "$id" == all ]]; then
+      jq -r '[.tasks[].files[]] | unique | .[]' "$RUN/plan.json" > "$wt/.duo-task-files.txt"
+    else
+      jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .files[]' "$RUN/plan.json" > "$wt/.duo-task-files.txt"
+    fi
     ids+=("$id")
   done < "$RUN/ids"
   echo
@@ -916,57 +1344,67 @@ implement() {
 }
 
 summary() {
-  local run="$1" id f src tr icon st outcome fr b sc cells nfix nrej US=$'\x1f'
+  local run="$1" id f src tr st outcome fr head b sh ni sc au nfix nrej US=$'\x1f' sev c e
+  set_width
   echo
   printf '  %sresult%s\n' "$BOLD" "$RST"
   while read -r id; do
     st="$(cat "$run/state-$id" 2>/dev/null)"
-    tr=""
-    case "$(cat "$run/tests-$id" 2>/dev/null)" in
-      pass) tr="${GRN}tests ✓${RST}" ;;
-      fail) tr="${RED}tests ✗${RST}" ;;
-    esac
+    bar
     case "$st" in
-      done)           icon="${GRN}✓${RST}" ;;
-      blocked)        icon="${RED}●${RST}" ;;
-      "no changes")   bar "${YLW}○${RST} ${BOLD}$id${RST}  agent made no changes ${DIM}— ${run#$ROOT/}/impl-$id.log${RST}"; continue ;;
-      "setup failed") bar "${RED}✗${RST} ${BOLD}$id${RST}  setup failed ${DIM}— ${run#$ROOT/}/setup-$id.log${RST}"; continue ;;
+      done)    head="${GRN}✓${RST} ${BOLD}$id${RST}" ;;
+      blocked) head="${RED}●${RST} ${BOLD}$id${RST}  ${RED}blocked${RST}" ;;
+      "no changes")   bar "${YLW}○${RST} ${BOLD}$id${RST}  agent made no changes  ${DIM}${run#$ROOT/}/impl-$id.log${RST}"; continue ;;
+      "setup failed") bar "${RED}✗${RST} ${BOLD}$id${RST}  setup failed  ${DIM}${run#$ROOT/}/setup-$id.log${RST}"; continue ;;
       *)              bar "${YLW}?${RST} ${BOLD}$id${RST}  ${st:-unknown}"; continue ;;
     esac
-    bar "$icon ${BOLD}$id${RST}  ${DIM}duo/$(basename "$run")/$id${RST}  $tr"
-
-    cells=""
-    for src in $(cat "$run/sources" 2>/dev/null || echo code); do
-      f="$run/final-$id-$src.json"
-      if ! jq -e '.issues' "$f" >/dev/null 2>&1; then cells="$cells$src ${YLW}?${RST}   "; continue; fi
-      b="$(jq '[.issues[] | select(.severity == "blocking")] | length' "$f")"
-      cells="$cells$src "
-      if [[ "$src" != code ]]; then cells="$cells$(color_score "$(jq -r "$JQ_SCORE score" "$f")") "; fi
-      if (( b > 0 )); then cells="$cells${RED}●$b${RST}   "; else cells="$cells${GRN}✓${RST}   "; fi
-    done
-    bar "   $cells"
+    tr=""
+    case "$(cat "$run/tests-$id" 2>/dev/null)" in
+      pass) tr="  ${GRN}tests ✓${RST}" ;;
+      fail) tr="  ${RED}tests ✗${RST}" ;;
+    esac
+    bar "$head$tr  ${DIM}duo/$(basename "$run")/$id${RST}"
 
     outcome="$(cut -d: -f1 "$run/fix-$id" 2>/dev/null)"; fr="$(cut -d: -f2 "$run/fix-$id" 2>/dev/null)"
     if [[ -n "$fr" && "$fr" != 0 ]]; then
       nfix="$(jq '[.[] | select(.decision == "fixed")] | length' "$run/fixlog-$id.json" 2>/dev/null)"
       nrej="$(jq '[.[] | select(.decision == "rejected")] | length' "$run/fixlog-$id.json" 2>/dev/null)"
       case "$outcome" in
-        clean)    bar "   ${BLU}↻${RST} $fr fix round(s) · ${nfix:-0} fixed · ${nrej:-0} rejected · all clear" ;;
-        cap)      bar "   ${BLU}↻${RST} $fr fix round(s) · ${nfix:-0} fixed · ${nrej:-0} rejected · ${RED}blockers left${RST} ${DIM}(/fixrounds to allow more)${RST}" ;;
-        deadlock) bar "   ${BLU}↻${RST} $fr fix round(s) · ${YLW}deadlock${RST} on $(cat "$run/dead-$id" 2>/dev/null) — builder rejected, reviewer insists" ;;
-        stalled)  bar "   ${BLU}↻${RST} $fr fix round(s) · ${YLW}the fix changed nothing${RST}" ;;
+        clean)    bar "${BLU}↻${RST} $fr fix round(s) · ${nfix:-0} fixed · ${nrej:-0} rejected · ${GRN}all clear${RST}" ;;
+        cap)      bar "${BLU}↻${RST} $fr fix round(s) · ${nfix:-0} fixed · ${nrej:-0} rejected · ${RED}blockers left${RST}  ${DIM}/fixrounds allows more${RST}" ;;
+        deadlock) bar_wrap 0 "↻ " "$BLU" "$fr fix round(s) · ${YLW}deadlock${RST} on $(cat "$run/dead-$id" 2>/dev/null): builder rejected, reviewer insists" ;;
+        stalled)  bar "${BLU}↻${RST} $fr fix round(s) · ${YLW}the last fix changed nothing${RST}" ;;
       esac
     elif [[ "$outcome" == cap ]]; then
-      bar "   ${RED}blockers left${RST} ${DIM}— auto-fix is off (/fixrounds 1)${RST}"
+      bar "${RED}blockers left${RST}  ${DIM}auto-fix is off · /fixrounds 1${RST}"
     fi
 
+    bar
+    lens_header
     for src in $(cat "$run/sources" 2>/dev/null || echo code); do
       f="$run/final-$id-$src.json"
-      jq -r --arg s "$src" '.issues[]? | select(.severity != "nit") | "\(.severity)\u001f\($s)\u001f\(.claim)\u001f\(.evidence)"' "$f" 2>/dev/null |
-        while IFS="$US" read -r sev s c e; do
-          if [[ "$sev" == blocking ]]; then bar "   ${RED}●${RST} ${DIM}$s${RST} $c ${DIM}$e${RST}"
-          else bar "   ${YLW}○${RST} ${DIM}$s${RST} $c ${DIM}$e${RST}"; fi
-        done
+      if ! jq -e '.issues' "$f" >/dev/null 2>&1; then
+        bar "   $(printf '%-11s' "$src") ${YLW}no result${RST}  ${DIM}${run#$ROOT/}/review-$id-$src-r1.log${RST}"
+        continue
+      fi
+      read -r b sh ni < <(jq -r '"\([.issues[] | select(.severity == "blocking")] | length) \([.issues[] | select(.severity == "should")] | length) \([.issues[] | select(.severity == "nit")] | length)"' "$f")
+      sc="–"; au=""
+      if [[ "$src" != code ]]; then
+        sc="$(jq -r "$JQ_SCORE score" "$f")"
+        au="$(jq -c '.auto // []' "$f")"
+      fi
+      lens_row "$([[ $src == code ]] && echo "code review" || echo "$src")" "$sc" "$au" "$b" "$sh" "$ni"
+    done
+
+    local any=0
+    for sev in blocking should; do
+      for src in $(cat "$run/sources" 2>/dev/null || echo code); do
+        f="$run/final-$id-$src.json"
+        while IFS="$US" read -r c e; do
+          if (( ! any )); then bar; any=1; fi
+          finding_lines "$sev" "$src" "$c" "$e"
+        done < <(jq -r --arg s "$sev" '.issues[]? | select(.severity == $s) | "\(.claim)\u001f\(.evidence // "")"' "$f" 2>/dev/null)
+      done
     done
   done < "$run/ids"
   echo
@@ -974,6 +1412,13 @@ summary() {
 }
 
 md_esc() { sed 's/|/\\|/g'; }
+JQ_CHECK_ROW='.auto[] | "| \(.name) | \(.layer) | \(.severity) | "
+  + (if .result == "pass" then "✅ pass" elif .result == "fail" then "❌ fail" else "➖ skip" end) + " | "
+  + ((if .result == "skip" then .note
+      elif (.issues | length) > 0 then ([.issues[:3][] | "`\(.file):\(.line)` \(.msg)"] | join("<br>"))
+      elif .result == "fail" then ((.tail | split("\n") | map(select(length > 0)) | last) // "")
+      else .desc end) | gsub("\\|"; "\\\\|") | gsub("\n"; " ")) + " |"'
+
 
 write_report() {
   local run="$1" out="$1/REPORT.md" id src f st last fr outcome
@@ -1000,6 +1445,14 @@ write_report() {
       jq -r "$JQ_SCORE"' . as $r | .lenses[] | .name as $n
         | "| \($n) | \(score)/10 | \([$r.issues[] | select(.lens == $n and .severity == "blocking")] | length) | \([.checks[]? | select(.result == "fail") | .item] | join("; ") | gsub("\\|"; "\\\\|")) |"' "$last"
       echo
+      jq -c '.lenses[] | select((.auto // []) | length > 0)' "$last" | while read -r lj; do
+        echo "**$(echo "$lj" | jq -r .name) · plan checks**"
+        echo
+        echo "| check | layer | severity | result | detail |"
+        echo "|---|---|---|---|---|"
+        echo "$lj" | jq -r "$JQ_CHECK_ROW"
+        echo
+      done
     fi
 
     if [[ -f "$run/ids" ]]; then
@@ -1039,9 +1492,15 @@ write_report() {
           echo
           jq -r '.issues[] | "- " + (if .severity == "blocking" then "❌" elif .severity == "should" then "⚠️" else "·" end)
             + " \(.severity) · \(.claim) `\(.evidence)`"' "$f"
-          jq -r '.checks[]? | select(.result == "fail") | "- ☐ failed check: \(.item)" + (if .note then " — \(.note)" else "" end)' "$f"
+          jq -r '.checks[]? | select(.result == "fail") | "- ☐ failed checklist item: \(.item)" + (if .note then " — \(.note)" else "" end)' "$f"
           if ! jq -e '(.issues | length) > 0 or ([.checks[]? | select(.result == "fail")] | length) > 0' "$f" >/dev/null; then
             echo "- ✅ nothing to report"
+          fi
+          if jq -e '(.auto // []) | length > 0' "$f" >/dev/null 2>&1; then
+            echo
+            echo "| check | layer | severity | result | detail |"
+            echo "|---|---|---|---|---|"
+            jq -r "$JQ_CHECK_ROW" "$f"
           fi
         done
         if jq -e 'length > 0' "$run/fixlog-$id.json" >/dev/null 2>&1; then
@@ -1078,6 +1537,8 @@ run_task() {
     fail "uncommitted changes — commit or stash first"; return 1
   fi
   resolve_roles
+  ensure_sources
+  ensure_trust
   BASE="$(git rev-parse --abbrev-ref HEAD)"
   STAMP="$(date +%Y%m%d-%H%M%S)"
   RUN="$ROOT/.duo/$STAMP"; REL=".duo/$STAMP"
@@ -1107,7 +1568,22 @@ $(split_rule) $NO_CODE"
   echo '[]' > "$RUN/ledger.json"
 
   STATUS=cap
+  PLAN_CHECKS="$(checked_lenses plan | xargs)"
   for ((i = 1; i <= ROUNDS; i++)); do
+    PC_NOTE=""
+    if [[ -n "$PLAN_CHECKS" ]]; then
+      local t0=$SECONDS l pc_line=""
+      for l in $PLAN_CHECKS; do
+        ( export DUO_PHASE=plan DUO_ROOT="$ROOT" DUO_BASE="$BASE" DUO_PLAN="$RUN/PLAN.md" DUO_PLAN_JSON="$RUN/plan.json" \
+                 DUO_TASK="$RUN/task.txt" DUO_LIB="$(builtin_lens_dir)/_lib" DUO_PM="$(pkg_manager)"
+          cd "$ROOT" && run_checks "$l" plan "$RUN/plan-checks-$l-r$i.json" )
+        pc_line="$pc_line$l $(checks_line "$RUN/plan-checks-$l-r$i.json")   "
+      done
+      step_line "${GRN}✓${RST}" "checks r$i" duo $((SECONDS - t0)) "$pc_line"
+      PC_NOTE="Automated plan checks already ran; results are in $REL/plan-checks-<lens>-r$i.json for: $PLAN_CHECKS.
+Failed checks are added as issues automatically. Do not repeat them."
+    fi
+    if (( CANCEL )); then finish_cancel; return; fi
     run_step "review r$i" "$R_AGENT" "$RUN/review-$i.log" "Round $i. Review $REL/PLAN.md and $REL/plan.json against this repo.
 Original task: $task
 $SOLO_NOTE
@@ -1122,6 +1598,7 @@ $SEVERITY
 Cite the files you actually checked in evidence.
 
 $(plan_lens_block)
+$PC_NOTE
 Write $REL/review-$i.json, valid JSON only:
 $(plan_review_shape "$i")
 New issues get ids R$i-1, R$i-2, ... An empty issues array is a valid answer.
@@ -1134,6 +1611,7 @@ $NO_CODE"
       step_line "${RED}✗${RST}" "review r$i" "$R_AGENT" "$STEP_T" "no valid review — see $REL/review-$i.log"
       echo failed > "$RUN/status"; trap - INT; return 1
     fi
+    for l in $PLAN_CHECKS; do merge_plan_checks "$LAST" "$RUN/plan-checks-$l-r$i.json" "$l" "$i"; done
     B="$(jq '[.issues[] | select(.severity == "blocking")] | length' "$LAST")"
     S="$(jq '[.issues[] | select(.severity == "should")] | length' "$LAST")"
     N="$(jq '[.issues[] | select(.severity == "nit")] | length' "$LAST")"
@@ -1217,6 +1695,10 @@ help() {
     /planonly on|off        stop after the plan loop
     /lenses [a,b|off]       specialist reviewers (no argument: menu)
     /fixrounds N            auto-fix rounds for blocking findings  ${DIM}0–3${RST}
+    /lenses checks          list every check, its layer and trust state
+    /lenses add <src@ref>   add a lens source (github:org/repo@tag or git URL@ref)
+    /lenses sources|update|remove <src>
+    /trust [reset]          approve repo/source checks · forget approvals
     /save · /save global    persist for this repo · for all repos
     /reset                  back to built-in defaults
   ${BOLD}runs${RST}
@@ -1277,6 +1759,60 @@ set_enum() { # key name value options...
     if [[ "$v" == "$o" ]]; then printf -v "$k" '%s' "$v"; ok "$n → $v"; return; fi
   done
   fail "usage: /$n $(echo "$@" | tr ' ' '|')"
+}
+
+source_add() {
+  local spec; spec="$(echo "$1" | xargs)"
+  if [[ -z "$spec" ]]; then fail "usage: /lenses add github:org/repo@tag  (or any git URL@ref)"; return; fi
+  source_url_ref "$spec"
+  if [[ -z "$SRC_REF" ]]; then warn "no @ref given — pin a tag or commit so updates are deliberate"; fi
+  printf '  %s…%s fetching %s\n' "$CYN" "$RST" "$SRC_URL"
+  if ! fetch_source "$spec"; then fail "could not clone $SRC_URL${SRC_REF:+ at $SRC_REF}"; return; fi
+  case ",$SOURCES," in *",$spec,"*) ;; *) SOURCES="${SOURCES:+$SOURCES,}$spec" ;; esac
+  ok "added $spec — lenses: $(ls "$(source_lens_root "$spec")" 2>/dev/null | grep -vE '\.|^_' | xargs)"
+  note "its checks need your approval before they run · /save keeps the source for this repo"
+}
+source_remove() {
+  local spec; spec="$(echo "$1" | xargs)"
+  SOURCES="$(echo "$SOURCES" | tr ',' '\n' | grep -vxF "$spec" | paste -sd, -)"
+  ok "removed $spec · /save to persist"
+}
+list_sources() {
+  local d
+  echo
+  bar "${DIM}community${RST}  $(builtin_lens_dir)"
+  for s in $(echo "$SOURCES" | tr ',' ' '); do
+    d="$(source_dir "$s")"
+    if [[ -d "$d" ]]; then bar "${DIM}source${RST}     $s  ${DIM}$(git -C "$d" rev-parse --short HEAD 2>/dev/null)${RST}"
+    else bar "${DIM}source${RST}     $s  ${YLW}not fetched${RST}"; fi
+  done
+  bar "${DIM}personal${RST}   $CFG_DIR/lenses"
+  bar "${DIM}project${RST}    ${ROOT}/duo-lenses"
+  echo
+}
+update_sources() {
+  local s
+  if [[ -z "$SOURCES" ]]; then note "no lens sources configured"; return; fi
+  for s in $(echo "$SOURCES" | tr ',' ' '); do
+    if fetch_source "$s"; then ok "updated $s"; else fail "could not update $s"; fi
+  done
+  note "changed checks will ask for approval again"
+}
+list_checks() {
+  local l ph f st
+  echo
+  for l in $(lens_names); do
+    case ",$LENSES," in *",$l,"*) st="${GRN}on${RST}" ;; *) st="${DIM}off${RST}" ;; esac
+    printf '  %s%s%s  %s\n' "$BOLD" "$l" "$RST" "$st"
+    for ph in plan code; do
+      while read -r f; do
+        [[ -n "$f" ]] || continue
+        printf '  %s┃%s %-4s %-9s %-22s %s%-9s%s %s%s%s\n' "$MAG" "$RST" "$ph" "$(check_meta "$f" severity)" \
+          "$(basename "$f")" "$DIM" "$(layer_name "$f")" "$RST" "$DIM" "$(check_desc "$f")$(is_trusted "$f" || echo ' · not trusted yet')" "$RST"
+      done < <(lens_checks "$l" "$ph")
+    done
+  done
+  echo
 }
 
 open_report() {
@@ -1396,7 +1932,17 @@ slash() { # returns 1 to quit
     /env)           set_enum ENV_COPY env "$arg" on off ;;
     /planonly)      set_enum PLAN_ONLY planonly "$arg" on off ;;
     /settings|/s)   lens_picker && note "applies now · /save keeps it for this repo · /save global for all repos" ;;
-    /lenses)        if [[ -z "$arg" ]]; then lens_picker && note "applies now · /save to keep it for this repo"; else set_lenses "$arg"; fi ;;
+    /lenses)
+      case "${arg%% *}" in
+        "")          lens_picker && note "applies now · /save to keep it for this repo" ;;
+        add)         source_add "${arg#add}" ;;
+        remove|rm)   source_remove "${arg#* }" ;;
+        sources)     list_sources ;;
+        update)      update_sources ;;
+        checks)      list_checks ;;
+        *)           set_lenses "$arg" ;;
+      esac ;;
+    /trust)         if [[ "$arg" == reset ]]; then rm -f "$TRUST_FILE"; ok "forgot all approvals"; else ensure_trust; fi ;;
     /fixrounds)     set_num FIX_ROUNDS fixrounds "$arg" 0 3 ;;
     /report)        open_report "$arg" ;;
     /setup)         if [[ -n "$arg" ]]; then SETUP="$arg"; ok "setup → $SETUP ($(resolve_setup || true))"; else fail "usage: /setup auto|none|<cmd>"; fi ;;
@@ -1550,6 +2096,11 @@ doctor() {
     else
       warn "$a not installed — $( [[ $a == codex ]] && echo 'npm install -g @openai/codex, then codex login' || echo 'npm install -g @anthropic-ai/claude-code, then run claude to log in')"
     fi
+  done
+  echo
+  for t in gitleaks semgrep; do
+    if command -v "$t" >/dev/null 2>&1; then ok "$t  ${DIM}used by the security lens${RST}"
+    else note "  optional: $t not installed (brew install $t) — the security lens skips or falls back"; fi
   done
   echo
   case "$n" in

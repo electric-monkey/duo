@@ -1,0 +1,6 @@
+# Every pull request needs a review from a code owner.
+# Checks in lenses/ run on users' machines, so they get the same scrutiny as bin/duo.
+*           @chrassendk
+/lenses/    @chrassendk
+/bin/       @chrassendk
+/.github/   @chrassendk

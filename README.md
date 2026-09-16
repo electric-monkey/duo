@@ -31,7 +31,7 @@ Defaults shown. Every value is configurable.
 | approve | you | `y` build · `n` stop · `e` edit the plan |
 | build | claude | one worktree and branch per task; tasks with disjoint files run in parallel (max 3) |
 | test | duo | your test command, e.g. `bun run test` |
-| review | codex | issues on the diff, plus optional security / ux / product lenses |
+| review | codex | issues on the diff, plus optional security / ux / product lenses with automated checks |
 | fix | claude | 1 round for `blocking` issues, then test and review again |
 | report | duo | `REPORT.md`: scores, findings, decisions |
 | merge | you | `/merge`: `--no-ff`, stops on conflict, runs tests on the result |
@@ -96,7 +96,8 @@ duo › add rate limiting to the public API, 60 requests per minute per key
 - [Threat model](#threat-model)
 - [Signals](#signals)
 - [Known limitations](#known-limitations)
-- [Hacking on duo](#hacking-on-duo)
+- [Development](#development)
+- [Contributing](#contributing)
 - [FAQ](#faq)
 
 ---
@@ -308,13 +309,13 @@ gate ──► build ──► test ──► ┌ code review ┐
 
 Plan lenses share the plan reviewer's call, so they cost tokens, not extra round-trips. Code lenses each get their own agent run on the *non-building* model, concurrently inside each worktree.
 
-### Scores are derived, not vibed
+### Scores are derived
 
-Models give poorly calibrated numeric scores, so duo doesn't ask for one. Each lens evaluates every checklist item as `pass`, `fail` or `n/a`, and duo computes
+Models give poorly calibrated numeric scores, so duo doesn't ask for one. Each lens reviewer evaluates every checklist item as `pass`, `fail` or `n/a`; automated checks add their own pass/fail results; duo computes
 
 $$\text{score} = 10 \cdot \frac{\lvert \text{pass} \rvert}{\lvert \text{pass} \rvert + \lvert \text{fail} \rvert}$$
 
-rounded to one decimal, with `n/a` excluded. A lens with nothing applicable scores `–`. The score is informational; only `blocking` findings drive behaviour.
+rounded to one decimal, with `n/a` and skipped checks excluded. A lens with nothing applicable scores `–`. The score is informational; only `blocking` findings drive behaviour.
 
 ### The fix loop
 
@@ -349,21 +350,122 @@ duo › /fixrounds 2             # 0 disables auto-fix
 duo › /save                    # keep it for this repo
 ```
 
-### Custom lenses
+### Checks
 
-Drop a file in either place; later wins on name clashes:
+A lens can also carry executable checks. They run before the lens reviewer, their results are shown to it as evidence, and failed checks become findings with the check's own severity. A failed `blocking` check is a blocker no matter what the model thinks, and goes through the fix loop like any other.
 
-| location | scope |
+```
+lenses/security/
+├── LENS.md
+└── checks/
+    ├── secrets.sh
+    ├── dangerous-patterns.sh
+    ├── deps-audit.sh
+    └── semgrep.sh
+```
+
+Built-in checks:
+
+| lens | check | phase | severity | what it does |
+|---|---|---|---|---|
+| security | `secrets` | code | blocking | credential patterns in added lines; also runs gitleaks if installed |
+| security | `dangerous-patterns` | code | should | `eval`, raw HTML, shell or SQL built from strings, unsafe deserialization |
+| security | `deps-audit` | code | blocking | critical advisories via `npm`/`pnpm`/`bun audit`, only when dependencies changed |
+| security | `semgrep` | code | blocking | your repo's own `.semgrep.yml` rules on changed files; never downloads rules |
+| ux | `a11y-basics` | code | should | missing alt text, clickable divs, unlabeled inputs, positive tabIndex, removed focus outlines |
+| ux | `i18n-parity` | code | should | every language file has the same keys, when a translation file changed |
+| ux | `hardcoded-text` | code | nit | literal text in components, in projects that use translations |
+| product | `plan-acceptance` | plan | should | the plan says how to verify it's done |
+| product | `plan-scope` | plan | should | at most 15 files and 6 tasks (`DUO_MAX_PLAN_FILES`, `DUO_MAX_PLAN_TASKS`) |
+| product | `plan-dependencies` | plan | nit | the plan adds dependencies |
+| product | `out-of-plan-files` | code | should | files changed that the plan didn't list; tests and lockfiles excluded |
+| product | `new-dependencies` | code | should | packages added to any `package.json` |
+| product | `todos-added` | code | nit | new `TODO` / `FIXME` / `HACK` comments |
+
+The ux checks are single-line heuristics. They catch the common cases, not everything.
+
+A lens whose reviewer only runs on plans (like `product`) still runs its code checks; it just doesn't spend an agent call on the diff.
+
+#### Check contract
+
+| | |
 |---|---|
-| `<package>/lenses/` | built-in |
-| `~/.config/duo/lenses/` | you |
-| `<repo>/duo-lenses/` | your team (commit it) |
+| file | any file in `<lens>/checks/`; `.sh` → bash, `.py` → python3, `.js` → node, `.ts` → bun, otherwise must be executable |
+| header | `# duo: severity=blocking\|should\|nit phase=code\|plan` in the first 15 lines, then a one-line description comment |
+| exit | `0` pass · `1` fail · `2` not applicable (last output line is shown as the reason) · anything else is reported as a crash |
+| locations | print `::issue file=src/a.ts,line=12::message` lines |
+| timeout | 180 s (`DUO_CHECK_TIMEOUT`) |
+| cwd | the worktree (code) or your checkout (plan) |
 
-Good lenses have 6–10 checklist items that a reviewer can answer from a diff, and a `blocking` definition narrow enough that it rarely fires.
+Environment:
+
+| variable | phase | content |
+|---|---|---|
+| `DUO_PHASE` | both | `plan` or `code` |
+| `DUO_ROOT` | both | directory the check runs in |
+| `DUO_BASE` | both | base branch |
+| `DUO_LIB` | both | helper directory; `. "$DUO_LIB/diff.sh"` |
+| `DUO_PM` | both | `bun`, `pnpm`, `yarn`, `npm` or empty |
+| `DUO_LENS`, `DUO_CHECK` | both | names |
+| `DUO_PLAN`, `DUO_PLAN_JSON` | both | the plan |
+| `DUO_TASK` | both | the task (text or task file) |
+| `DUO_DIFF` | code | unified diff of the change |
+| `DUO_CHANGED_FILES` | code | file with one changed path per line |
+| `DUO_TASK_FILES` | code | file with the paths the plan listed for this task |
+| `DUO_TEST_CMD` | code | resolved test command |
+
+`diff.sh` provides `added_lines [path-regex]` (tab-separated file, line, text), `changed_files [path-regex]`, `issue FILE LINE MSG` and `skip MSG`.
+
+A check can be as small as running one of your existing test files:
+
+```bash
+#!/usr/bin/env bash
+# duo: severity=blocking
+# One hotel can never read another hotel's data
+bun test tests/security/tenant-isolation.test.ts
+```
+
+### Layers
+
+Lenses and checks come from four places. For each lens, the highest layer with a `LENS.md` defines the prompt; **checks are merged across all layers** by file name. So a repo can add checks to the built-in `security` lens without redefining it.
+
+| layer | location | trusted by default |
+|---|---|---|
+| community | `lenses/` in this package | yes, reviewed and versioned with duo |
+| source | git repos added with `/lenses add`, pinned to a ref | no |
+| personal | `~/.config/duo/lenses/` | yes, you wrote them |
+| project | `duo-lenses/` in your repo (commit it) | no |
+
+```
+your-repo/
+└── duo-lenses/
+    └── security/
+        └── checks/
+            └── tenant-isolation.sh     ← added to the built-in security lens
+```
+
+Org sources:
+
+```
+duo › /lenses add github:your-org/duo-checks@v1.2     # or any git URL@ref
+duo › /lenses sources
+duo › /lenses update                                  # re-fetch; changed checks ask again
+duo › /save                                           # keep the source for this repo
+```
+
+Private repos work with whatever git credentials you have (`gh auth setup-git`). Pin a tag: an unpinned source changes under you.
+
+### Trust
+
+Project and source checks are code from someone else that runs on your machine. Before a run, duo lists any such check it hasn't seen, with a hash, and asks: run and trust these versions, view them, or skip them. Approvals are stored as `sha256 path` in `~/.config/duo/trusted`, so a changed script asks again. Without a terminal, untrusted checks are skipped. `/trust reset` forgets all approvals.
+
+Project checks always run from your checkout, not from the worktree, so the building agent can't edit a check to make it pass.
+
+`/lenses checks` lists every check with its phase, severity, layer and trust state.
 
 ### Reports
 
-Every build writes `REPORT.md` into the run directory: plan-lens scores, a scorecard per task and source, findings with evidence, failed checks, the fix log, and the plan's decision ledger. `/report` regenerates and opens it.
+Every build writes `REPORT.md` into the run directory: plan-lens scores, a scorecard per task and source, findings with evidence, failed checklist items, a table of every automated check (layer, severity, result, location), the fix log, and the plan's decision ledger. `/report` regenerates and opens it.
 
 ```markdown
 | task    | tests | code | security       | ux          | fixes            |
@@ -439,6 +541,9 @@ Slash commands:
 | `/lenses [a,b\|off]` | specialist reviewers; no argument opens the picker |
 | `/fixrounds N` | auto-fix rounds for blocking findings (0–3) |
 | `/report [run]` | regenerate and open `REPORT.md` |
+| `/lenses checks` | list every check with phase, severity, layer and trust state |
+| `/lenses add <src@ref>` · `sources` · `update` · `remove <src>` | manage lens sources |
+| `/trust` · `/trust reset` | approve pending project/source checks · forget approvals |
 | `/save` · `/save global` | persist for this repo · for all repos |
 | `/reset` | built-in defaults (not persisted) |
 | `/runs` | recent runs |
@@ -478,6 +583,7 @@ built-in defaults
 | `PLAN_ONLY` | `off` | `DUO_PLAN_ONLY` |
 | `LENSES` | *(none)* | `DUO_LENSES` |
 | `FIX_ROUNDS` | `1` | `DUO_FIX_ROUNDS` |
+| `SOURCES` | *(none)* | `DUO_SOURCES` |
 
 Config files are parsed as `KEY=value` lines against an allowlist. They are never `source`d, so a config file can't execute code.
 
@@ -623,7 +729,8 @@ Why the manual tree-walk: in a non-interactive bash, background jobs ignore `SIG
 ## Known limitations
 
 - `claude -p` only prints when it finishes. Live activity comes from `--output-format stream-json`, so the spinner shows tool calls, not prose.
-- The live board needs a terminal at least 76 columns wide.
+- The live board drops its timeline column below about 64 columns, and the lens table switches to a compact layout below about 76.
+- Checks that need a running app (`requires=live`) are recognised but skipped for now.
 - Agent CLIs change their flags often. If a run fails instantly, run `duo doctor` and check the step's log.
 - The "serial estimate" assumes task durations are independent of concurrency. On a laptop with three agents and three `bun install`s running, they aren't entirely.
 - Semantic conflicts survive textual merges. Always run the full test suite after `/merge`, which duo does if `TEST` resolves to something.
@@ -634,37 +741,63 @@ Why the manual tree-walk: in a non-interactive bash, background jobs ignore `SIG
 
 ---
 
-## Hacking on duo
+## Development
 
-duo is one bash file, `bin/duo`, on purpose. Ground rules:
-
-1. **bash 3.2 compatible.** No associative arrays, no `mapfile`, no `wait -n`, no `${var,,}`, no empty arrays under `set -u`.
-2. **No runtime dependencies beyond git and jq.** If you want Python, you want a different project.
-3. **Agents produce files, duo produces commits.** Keep it that way.
-4. **Every agent output is validated before use.**
-
-Local development:
+Run duo from a checkout instead of the npm package:
 
 ```bash
-git clone https://github.com/electric-monkey/duo && cd duo
-npm link              # global `duo` now points at your checkout
-bash -n bin/duo       # syntax check
-shellcheck bin/duo    # recommended
+git clone https://github.com/electric-monkey/duo
+cd duo
+npm link          # the global `duo` now points at this checkout
+duo --version
 ```
 
-Don't `npm install -g @electricmonkey/duo` on your dev machine; it replaces the link with the published copy.
+Edits to `bin/duo` and `lenses/` take effect immediately. Don't run `npm install -g @electricmonkey/duo` on the same machine; it replaces the link. Run `npm link` again if that happens.
 
-Releasing (the version lives in two places):
+Tests need no model access. Stub agents in `test/stubs/` play both roles:
 
 ```bash
-V=2.2.1
+npm test                          # both suites
+bash test/run-checks.sh           # every lens check against its fixtures
+bash test/run-checks.sh secrets   # one check
+bash test/e2e.sh                  # full run: plan → review → build → checks → fix → report
+shellcheck -S error bin/duo lenses/*/checks/*.sh
+```
+
+CI runs the same on Ubuntu and on macOS with `/bin/bash` 3.2.
+
+```
+bin/duo                  the tool (one bash file)
+lenses/<lens>/LENS.md    reviewer prompt and checklist
+lenses/<lens>/checks/    executable checks
+lenses/_lib/diff.sh      helpers for checks
+test/run-checks.sh       check test harness
+test/fixtures/           pass / fail / skip cases per check
+test/e2e.sh              end-to-end run with stub agents
+test/stubs/agent         fake claude / codex
+```
+
+## Contributing
+
+Contributions are welcome, especially lens checks. The short version:
+
+1. Add `lenses/<lens>/checks/<name>.sh` with a `# duo: severity=...` header.
+2. Add fixtures in `test/fixtures/<lens>/<name>/`: at least one `pass-` and one `fail-` case.
+3. Run `npm test`, then open a pull request.
+
+Every pull request needs a green CI run and a review from a code owner, because checks run on other people's machines. Checks specific to your own codebase belong in your repo's `duo-lenses/` folder instead.
+
+Full guide: [CONTRIBUTING.md](CONTRIBUTING.md). Security reports: [SECURITY.md](SECURITY.md).
+
+Releases (maintainers):
+
+```bash
+V=2.5.1
 sed -i '' "s/^VERSION=.*/VERSION=\"$V\"/" bin/duo
 npm version $V --no-git-tag-version
 git commit -am "duo $V" && git tag v$V && git push --follow-tags
 npm publish
 ```
-
-For end-to-end tests without burning tokens, put stub `claude` and `codex` scripts first on your `PATH` that write the expected JSON files. duo only cares about what lands on disk.
 
 ---
 

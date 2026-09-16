@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Stand-in for `claude` and `codex` in tests. Reads duo's prompt (the last
+# argument), recognises which step it is, and writes the files a real agent would.
+# No network, no tokens. Symlinked or copied as both `claude` and `codex`.
+for a in "$@"; do
+  if [[ "$a" == --help ]]; then echo "  --sandbox  --permission-mode  status"; exit 0; fi
+done
+[[ "${1:-} ${2:-}" == "login status" ]] && exit 0
+p="${*: -1}"
+run="$(echo "$p" | grep -o '\.duo/[0-9-]*' | head -1)"
+echo "stub $(basename "$0") working"
+
+if [[ "$p" == *"Investigate the repo"* ]]; then
+  printf '# Plan\n1. Add src/limit.js\n\n## Acceptance criteria\n- limit is exported\n' > "$run/PLAN.md"
+  echo '{"summary":"Add a rate limit constant","parallel":false,"reason":"single file","tasks":[{"id":"limit","title":"Add limit","instructions":"Create src/limit.js","files":["src/limit.js"]}]}' > "$run/plan.json"
+elif [[ "$p" == *"Update $run/PLAN.md"* ]]; then
+  printf -- '- handles zero\n- handles negatives\n- documented\n- tested\n- reviewed\n' >> "$run/PLAN.md"
+  jq '[.issues[] | {id, decision: "accepted", reason: "done", round: 1}]' "$run/review-1.json" > "$run/ledger.json"
+elif [[ "$p" == Round\ * ]]; then
+  n="$(echo "$p" | head -1 | sed 's/^Round \([0-9]*\).*/\1/')"
+  if [[ "$n" == 1 ]]; then
+    echo '{"issues":[{"id":"R1-1","lens":"general","severity":"blocking","claim":"no edge cases","evidence":"PLAN.md","reraised":false}]}' > "$run/review-1.json"
+  else
+    echo '{"issues":[]}' > "$run/review-$n.json"
+  fi
+elif [[ "$p" =~ Write\ \.duo-review-([a-z]+)\.json ]]; then
+  src="${BASH_REMATCH[1]}"
+  if [[ "$src" == code ]]; then echo '{"issues":[]}' > .duo-review-code.json
+  else echo "{\"lens\":\"$src\",\"checks\":[{\"item\":\"reviewed\",\"result\":\"pass\"}],\"issues\":[]}" > ".duo-review-$src.json"; fi
+elif [[ "$p" == *".duo-blockers.json"* ]]; then
+  grep -v 'AKIA' src/limit.js > src/limit.js.tmp; mv src/limit.js.tmp src/limit.js
+  jq '[.[] | {id, decision: "fixed", reason: "removed", round: 1}]' .duo-blockers.json > .duo-fixlog.json
+else
+  mkdir -p src
+  printf 'export const limit = 60;\nexport const key = "AKIA%s";\n' "$(printf 'Q%.0s' $(seq 1 16))" > src/limit.js
+fi

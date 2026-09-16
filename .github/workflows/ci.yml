@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # /bin/bash is 3.2 on macOS: the version duo promises to support
+      DUO_TEST_BASH: /bin/bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          command -v jq || { if [ "$RUNNER_OS" = macOS ]; then brew install jq; else sudo apt-get install -y jq; fi; }
+          /bin/bash --version | head -1
+          jq --version
+
+      - name: Syntax
+        run: |
+          /bin/bash -n bin/duo
+          for f in lenses/_lib/*.sh lenses/*/checks/*.sh test/*.sh test/stubs/agent; do /bin/bash -n "$f"; done
+
+      - name: ShellCheck
+        if: runner.os == 'Linux'
+        run: shellcheck -S error bin/duo lenses/_lib/*.sh lenses/*/checks/*.sh test/*.sh test/stubs/agent
+
+      - name: Lens checks against fixtures
+        run: /bin/bash test/run-checks.sh
+
+      - name: End-to-end with stub agents
+        run: /bin/bash test/e2e.sh
+
+      - name: Package contents
+        run: npm pack --dry-run
