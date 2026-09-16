@@ -13,7 +13,7 @@
 #  Requires: git, jq, claude, codex.  Works with macOS bash 3.2.
 # ─────────────────────────────────────────────────────────────────────────────
 set -o pipefail
-VERSION="2.1.0"
+VERSION="2.2.0"
 PKG="@electricmonkey/duo"
 
 # ── settings ────────────────────────────────────────────────────────────────
@@ -81,12 +81,14 @@ step_line() { # icon label who seconds detail
 }
 
 banner() {
-  printf '\n  %s%s◆ duo%s %sv%s · codex plans · claude reviews · worktrees build%s\n' \
-    "$BOLD" "$MAG" "$RST" "$DIM" "$VERSION" "$RST"
-  printf '  %srepo%s %s   %sbranch%s %s   %simpl%s %s   %srounds%s %s   %ssplit%s %s\n' \
-    "$DIM" "$RST" "$REPO" "$DIM" "$RST" "$(git branch --show-current)" \
-    "$DIM" "$RST" "$IMPL" "$DIM" "$RST" "$ROUNDS" "$DIM" "$RST" "$SPLIT"
-  printf '  %stype a task to start · /help for commands · ctrl-d to quit%s\n\n' "$DIM" "$RST"
+  local c1="" c2="" c3=""
+  if (( TTY )); then c1="$ESC[38;5;213m"; c2="$ESC[38;5;141m"; c3="$ESC[38;5;81m"; fi
+  echo
+  printf '  %s%s┌┬┐%s┬ ┬%s┌─┐%s   %sduo%s %sv%s%s\n' "$BOLD" "$c1" "$c2" "$c3" "$RST" "$BOLD" "$RST" "$DIM" "$VERSION" "$RST"
+  printf '  %s%s ││%s│ │%s│ │%s   %scodex plans · claude reviews · worktrees build%s\n' "$BOLD" "$c1" "$c2" "$c3" "$RST" "$DIM" "$RST"
+  printf '  %s%s─┴┘%s└─┘%s└─┘%s   %s%s%s · %s · %s builds · %s rounds · split %s%s\n' "$BOLD" "$c1" "$c2" "$c3" "$RST" \
+    "$DIM" "$RST$BOLD" "$REPO" "$RST$DIM$(git branch --show-current)" "$IMPL" "$ROUNDS" "$SPLIT" "$RST"
+  printf '\n  %stype a task · /help for commands · ctrl-c to quit%s\n\n' "$DIM" "$RST"
 }
 
 # ── environment detection ───────────────────────────────────────────────────
@@ -214,6 +216,7 @@ plan_card() {
   fi
   if [[ "$par" == true ]]; then
     bar "${CYN}⇉ parallel${RST} ${DIM}$(jq -r '.reason' "$run/plan.json")${RST}"
+    bar "  $(parallel_estimate "$(jq '.tasks | length' "$run/plan.json")")"
   else
     bar "${BLU}→ serial${RST}   ${DIM}$(jq -r '.reason' "$run/plan.json")${RST}"
   fi
@@ -228,6 +231,27 @@ plan_card() {
     done
   bar
   bar "${DIM}${run#$ROOT/}/PLAN.md${RST}"
+}
+
+avg_task_secs() { # average task duration from earlier runs in this repo
+  cat "$ROOT"/.duo/2*/times-* 2>/dev/null | awk '
+    $1 == "setup" || $1 == "build" { if (!s) s = $2 }
+    $1 == "end" && s { t += $2 - s; n++; s = 0 }
+    END { if (n) print int(t / n) }'
+}
+
+parallel_estimate() { # $1 = task count
+  local n="$1" p="$PARALLEL" avg waves
+  if (( p > n )); then p=$n; fi
+  waves=$(( (n + p - 1) / p ))
+  avg="$(avg_task_secs)"
+  if [[ -n "$avg" ]] && (( avg > 0 )); then
+    printf '%s%s tasks · %s at once · est. %s serial → %s~%s%s parallel %s(from earlier runs)%s' "$DIM" "$n" "$p" \
+      "$(fmt_t $((n * avg)))" "$RST$GRN" "$(fmt_t $((waves * avg)))" "$RST" "$DIM" "$RST"
+  else
+    printf '%s%s tasks · %s at once · up to %s%s×%s%s faster wall-clock (estimate improves after the first run)%s' "$DIM" "$n" "$p" \
+      "$RST$GRN" "$(( n / waves ))" "$RST" "$DIM" "$RST"
+  fi
 }
 
 split_check() { # decides final serial/parallel for $RUN
@@ -250,7 +274,10 @@ gate() {
     if [[ "$PLAN_ONLY" == on ]]; then note "plan-only mode — stopping here (/planonly off to build)"; return 1; fi
     printf '\n  %s›%s build with %s%s%s, review by %s? %s[y]es · [p]lan · [e]dit · [n]o%s ' \
       "$MAG" "$RST" "$BOLD" "$IMPL" "$RST" "$(other "$IMPL")" "$DIM" "$RST"
-    read -rsn1 key; echo
+    trap ':' INT
+    read -rsn1 key || key=n
+    trap - INT
+    echo
     case "$key" in
       y|Y) return 0 ;;
       p|P) ${PAGER:-less -R} "$RUN/PLAN.md" ;;
@@ -270,42 +297,43 @@ wt_path() { echo "$(dirname "$ROOT")/$REPO-wt-$STAMP-$1"; }
 branch()  { echo "duo/$STAMP/$1"; }
 setst()   { echo "$2" > "$RUN/state-$1"; }
 
+mark() { echo "$2 $(date +%s)" >> "$RUN/times-$1"; }
+
 work() {
   local id="$1" wt f copied="" rc
   wt="$(wt_path "$id")"
-  cd "$wt" || { setst "$id" failed; return; }
-  date +%s > "$RUN/t0-$id"
+  cd "$wt" || { setst "$id" failed; mark "$id" end; return; }
   if [[ "$ENV_COPY" == on ]]; then
     for f in "$ROOT"/.env*; do
       if [[ -f "$f" ]]; then cp "$f" . && copied="$copied $(basename "$f")"; fi
     done
   fi
   if [[ -n "$SETUP_CMD_R" ]]; then
-    setst "$id" setup
-    bash -c "$SETUP_CMD_R" > "$RUN/setup-$id.log" 2>&1 || { setst "$id" "setup failed"; date +%s > "$RUN/t1-$id"; return; }
+    setst "$id" setup; mark "$id" setup
+    bash -c "$SETUP_CMD_R" > "$RUN/setup-$id.log" 2>&1 || { setst "$id" "setup failed"; mark "$id" end; return; }
   fi
 
-  setst "$id" building
+  setst "$id" building; mark "$id" build
   agent "$IMPL" "Read .duo-plan.md for context. Implement ONLY the task in
 .duo-task.md. Touch only the files that task needs. Do not commit." > "$RUN/impl-$id.log" 2>&1
 
   git add -A
   if [[ -n "$copied" ]]; then git reset -q -- $copied 2>/dev/null; fi
   if ! git commit -qm "duo($id): $(head -1 .duo-task.md | sed 's/^# //')" >/dev/null 2>&1; then
-    setst "$id" "no changes"; date +%s > "$RUN/t1-$id"; return
+    setst "$id" "no changes"; mark "$id" end; return
   fi
   git diff "$BASE...HEAD" > .duo-diff.patch
 
   local tnote="No test command was run."
   if [[ -n "$TEST_CMD_R" ]]; then
-    setst "$id" testing
+    setst "$id" testing; mark "$id" test
     bash -c "$TEST_CMD_R" > .duo-test.log 2>&1; rc=$?
     cp .duo-test.log "$RUN/test-$id.log"
     if (( rc == 0 )); then echo pass > "$RUN/tests-$id"; tnote="Tests ($TEST_CMD_R) PASSED."
     else echo fail > "$RUN/tests-$id"; tnote="Tests ($TEST_CMD_R) FAILED — see .duo-test.log."; fi
   fi
 
-  setst "$id" reviewing
+  setst "$id" reviewing; mark "$id" review
   agent "$REVIEWER" "Review the diff in .duo-diff.patch against the task in
 .duo-task.md and the plan in .duo-plan.md. $tnote
 $SEVERITY
@@ -313,32 +341,103 @@ Write .duo-review.json, valid JSON only:
 {\"issues\":[{\"id\":\"C-1\",\"severity\":\"blocking|should|nit\",\"claim\":\"...\",\"evidence\":\"file:line\"}]}
 $NO_CODE" > "$RUN/codereview-$id.log" 2>&1
   cp .duo-review.json "$RUN/codereview-$id.json" 2>/dev/null
-  setst "$id" done
-  date +%s > "$RUN/t1-$id"
+  setst "$id" done; mark "$id" end
 }
 
-draw_board() { # $1 = frame index, $2 = 1 on first draw
-  local id st icon t0 t1 el now n
-  n="$(wc -l < "$RUN/ids" | tr -d ' ')"
-  if [[ "$2" != 1 ]]; then printf '%s[%sA' "$ESC" "$n"; fi
-  now="$(date +%s)"
+BAR_W=20
+task_first() { head -1 "$1" 2>/dev/null | cut -d' ' -f2; }
+task_end()   { awk '$1 == "end" { print $2 }' "$1" 2>/dev/null | tail -1; }
+task_setup() { awk '$1 == "setup" { s = $2 } $1 == "build" && s { print $2 - s; exit }' "$1" 2>/dev/null; }
+
+timing_stats() { # $1 = run dir → sets T_N T_SUM T_WALL T_EST T_SETUP
+  local run="$1" id f a e sm=0 st=0 ns=0 lo=0 hi=0 d
+  T_N=0
   while read -r id; do
+    f="$run/times-$id"
+    a="$(task_first "$f")"; e="$(task_end "$f")"
+    [[ -n "$a" && -n "$e" ]] || continue
+    T_N=$((T_N + 1)); sm=$((sm + e - a))
+    if (( lo == 0 || a < lo )); then lo=$a; fi
+    if (( e > hi )); then hi=$e; fi
+    d="$(task_setup "$f")"
+    if [[ -n "$d" ]]; then st=$((st + d)); ns=$((ns + 1)); fi
+  done < "$run/ids"
+  T_SUM=$sm; T_WALL=$((hi - lo)); T_SETUP=0
+  if (( ns > 0 )); then T_SETUP=$((st / ns)); fi
+  # serial would install dependencies once, not once per task
+  T_EST=$((sm - (T_N > 1 ? (T_N - 1) * T_SETUP : 0)))
+}
+
+ratio() { local r=$(( $1 * 10 / ($2 > 0 ? $2 : 1) )); printf '%d.%d×' $((r / 10)) $((r % 10)); }
+
+timeline() { # $1 = times file, $2 = board start, $3 = span → colored bar
+  local f="$1" t0="$2" span="$3" k t ph j out="" n=0 phs=() tss=() p ts
+  if [[ -f "$f" ]]; then
+    while read -r p ts; do phs[n]="$p"; tss[n]="$ts"; n=$((n + 1)); done < "$f"
+  fi
+  for ((k = 0; k < BAR_W; k++)); do
+    t=$(( t0 + (2 * k * span + span) / (2 * BAR_W) ))
+    ph=""
+    for ((j = 0; j < n; j++)); do
+      if (( ${tss[j]} <= t )); then ph="${phs[j]}"; fi
+    done
+    case "$ph" in
+      setup)  out="$out${DIM}░${RST}" ;;
+      build)  out="$out${CYN}█${RST}" ;;
+      test)   out="$out${YLW}█${RST}" ;;
+      review) out="$out${MAG}█${RST}" ;;
+      *)      out="$out${DIM}·${RST}" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+draw_board() { # $1 = frame, $2 = 1 on first draw, $3 = 1 when final
+  local id st icon el a e now tend span running=0 queued=0 hline f n
+  now="$(date +%s)"; tend="$now"
+  n="$(wc -l < "$RUN/ids" | tr -d ' ')"
+  if [[ "$3" == 1 ]]; then
+    tend="$BOARD_T0"
+    while read -r id; do e="$(task_end "$RUN/times-$id")"; if [[ -n "$e" ]] && (( e > tend )); then tend=$e; fi; done < "$RUN/ids"
+  fi
+  span=$((tend - BOARD_T0)); if (( span < 1 )); then span=1; fi
+  if [[ "$2" != 1 ]] && (( TTY )); then printf '%s[%sA' "$ESC" "$BOARD_LINES"; fi
+
+  hline="$(printf '─%.0s' $(seq 1 24))"
+  printf '\r%s  %s┌%s┬────────────┬─────────┬──────────────────────┐%s\n' "$CLR" "$DIM" "$hline" "$RST"
+  printf '\r%s  %s│%s %-22s %s│%s %-10s %s│%s %7s %s│%s %-20s %s│%s\n' "$CLR" "$DIM" "$RST$BOLD" "task" "$RST$DIM" "$RST$BOLD" "state" "$RST$DIM" "$RST$BOLD" "time" "$RST$DIM" "$RST$BOLD" "timeline" "$RST$DIM" "$RST"
+  printf '\r%s  %s├%s┼────────────┼─────────┼──────────────────────┤%s\n' "$CLR" "$DIM" "$hline" "$RST"
+  while read -r id; do
+    f="$RUN/times-$id"
     st="$(cat "$RUN/state-$id" 2>/dev/null || echo queued)"
     case "$st" in
-      queued)                icon="${DIM}·${RST}" ;;
-      setup|building)        icon="${CYN}${SPIN[$1 % 10]}${RST}" ;;
-      testing)               icon="${YLW}${SPIN[$1 % 10]}${RST}" ;;
-      reviewing)             icon="${MAG}${SPIN[$1 % 10]}${RST}" ;;
-      done)                  icon="${GRN}✓${RST}" ;;
-      *)                     icon="${RED}✗${RST}" ;;
+      queued)         icon="${DIM}·${RST}"; queued=$((queued + 1)) ;;
+      setup|building) icon="${CYN}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
+      testing)        icon="${YLW}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
+      reviewing)      icon="${MAG}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
+      done)           icon="${GRN}✓${RST}" ;;
+      *)              icon="${RED}✗${RST}" ;;
     esac
     el=""
-    if [[ -f "$RUN/t0-$id" ]]; then
-      t0="$(cat "$RUN/t0-$id")"; t1="$(cat "$RUN/t1-$id" 2>/dev/null || echo "$now")"
-      el="$(fmt_t $((t1 - t0)))"
-    fi
-    printf '\r%s  %s %-34s %s%-12s %7s%s\n' "$CLR" "$icon" "${id:0:34}" "$DIM" "$st" "$el" "$RST"
+    a="$(task_first "$f")"
+    if [[ -n "$a" ]]; then e="$(task_end "$f")"; el="$(fmt_t $(( ${e:-$now} - a )))"; fi
+    printf '\r%s  %s│%s %s %-20s %s│%s %-10s %s│%s %7s %s│%s %s %s│%s\n' "$CLR" "$DIM" "$RST" "$icon" "${id:0:20}" \
+      "$DIM" "$RST" "${st:0:10}" "$DIM" "$RST" "$el" "$DIM" "$RST" "$(timeline "$f" "$BOARD_T0" "$span")" "$DIM" "$RST"
   done < "$RUN/ids"
+  printf '\r%s  %s└%s┴────────────┴─────────┴──────────────────────┘%s\n' "$CLR" "$DIM" "$hline" "$RST"
+
+  if [[ "$3" == 1 ]]; then
+    timing_stats "$RUN"
+    if (( n > 1 && T_WALL > 0 && T_EST > T_WALL )); then
+      printf '\r%s  %s⇉%s %s tasks · wall %s%s%s · serial est. %s · saved %s~%s%s %s(%s faster)%s\n' "$CLR" "$CYN" "$RST" "$n" \
+        "$BOLD" "$(fmt_t "$T_WALL")" "$RST" "$(fmt_t "$T_EST")" "$GRN$BOLD" "$(fmt_t $((T_EST - T_WALL)))" "$RST" "$DIM" "$(ratio "$T_EST" "$T_WALL")" "$RST"
+    else
+      printf '\r%s  %s→%s %s task(s) · wall %s%s%s\n' "$CLR" "$BLU" "$RST" "$n" "$BOLD" "$(fmt_t "$T_WALL")" "$RST"
+    fi
+  else
+    printf '\r%s  %swall %s · %s running · %s queued     %s░ setup %s█ build %s█ test %s█ review%s\n' "$CLR" "$DIM" \
+      "$(fmt_t $((now - BOARD_T0)))" "$running" "$queued" "$RST$DIM" "$CYN" "$YLW" "$MAG" "$RST"
+  fi
 }
 
 implement() {
@@ -368,7 +467,9 @@ implement() {
   done < "$RUN/ids"
   echo
 
-  if (( TTY )); then draw_board 0 1; fi
+  BOARD_T0="$(date +%s)"
+  BOARD_LINES=$(( ${#ids[@]} + 5 ))
+  if (( TTY )); then draw_board 0 1 0; fi
   while :; do
     if (( CANCEL )); then break; fi
     running="$(jobs -rp | wc -l | tr -d ' ')"
@@ -377,12 +478,12 @@ implement() {
       next=$((next + 1)); running=$((running + 1))
     done
     sleep 0.15; i=$((i + 1))
-    if (( TTY )); then draw_board "$i" 0; fi
+    if (( TTY )); then draw_board "$i" 0 0; fi
     if (( next >= ${#ids[@]} )) && [[ -z "$(jobs -rp)" ]]; then break; fi
   done
   wait 2>/dev/null
-  if (( ! TTY )); then draw_board 0 1; fi
   if (( CANCEL )); then return 130; fi
+  if (( TTY )); then draw_board "$i" 0 1; else draw_board 0 1 1; fi
   summary "$RUN"
 }
 
@@ -538,7 +639,7 @@ $NO_CODE"
 finish_cancel() {
   trap - INT
   printf '\r%s' "$CLR"; echo
-  warn "cancelled · partial output kept in ${RUN#$ROOT/} · /trees and /clean to tidy worktrees"
+  warn "cancelled · partial output kept in ${RUN#$ROOT/} · /clean tidies worktrees · ctrl-c again to quit"
   echo cancelled > "$RUN/status"
   CANCEL=0
 }
@@ -736,10 +837,9 @@ repl() {
   set -o history; history -r "$HIST" 2>/dev/null
   PROMPT=$'\001'"$BOLD$MAG"$'\002''duo'$'\001'"$RST$DIM"$'\002'' › '$'\001'"$RST"$'\002'
   while :; do
-    trap ':' INT
+    trap 'printf "\n"; note "bye"; exit 0' INT
     IFS= read -e -r -p "$PROMPT" line; rc=$?
     trap - INT
-    if (( rc > 128 )); then echo; continue; fi
     if (( rc != 0 )); then echo; break; fi
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"

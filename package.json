@@ -1,14 +1,36 @@
 {
   "name": "@electricmonkey/duo",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Codex plans, Claude reviews, git worktrees build — a converging plan/review loop for coding agents",
-  "bin": { "duo": "bin/duo" },
-  "files": ["bin", "README.md", "LICENSE"],
-  "os": ["darwin", "linux"],
-  "keywords": ["claude-code", "codex", "ai", "agents", "code-review", "git-worktree", "cli"],
+  "bin": {
+    "duo": "bin/duo"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "claude-code",
+    "codex",
+    "ai",
+    "agents",
+    "code-review",
+    "git-worktree",
+    "cli"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/electric-monkey/duo.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/electric-monkey/duo.git"
+  },
   "homepage": "https://github.com/electric-monkey/duo#readme",
   "bugs": "https://github.com/electric-monkey/duo/issues",
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }
