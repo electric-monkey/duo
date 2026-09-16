@@ -6,10 +6,6 @@
 ▀▀  ▀▀▀ ▀▀▀
 ```
 
-**One agent writes the plan, the other reviews it until nothing blocks.<br>Then it's built in git worktrees and the other agent reviews the diff.**
-
-A single bash script that drives the Claude Code and Codex CLIs you already have.<br>No API keys, no server, no daemon.
-
 [![npm](https://img.shields.io/npm/v/@electricmonkey/duo?color=cb3837&label=npm)](https://www.npmjs.com/package/@electricmonkey/duo)
 ![bash](https://img.shields.io/badge/bash-3.2%2B-4EAA25)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
@@ -18,30 +14,43 @@ A single bash script that drives the Claude Code and Codex CLIs you already have
 
 </div>
 
----
+# duo
 
-## The problem
+A bash CLI that runs a plan → review → build → review loop between the Claude Code and Codex CLIs, and builds each task in its own git worktree.
 
-You run Claude Code in one terminal and Codex in another. You ask one for a plan, paste it into the other for review, paste the review back, and repeat. You are the message bus. After four rounds they are arguing about naming, and when you finally build, both agents edit the same checkout.
+## What it does
 
-## What duo does instead
+Defaults shown. Every value is configurable.
 
-1. **Plan.** Codex writes `PLAN.md` and a machine-readable `plan.json`.
-2. **Review until converged.** Claude reviews it and tags every issue `blocking`, `should` or `nit`. Codex revises and logs a decision per issue in a ledger. The loop stops when nothing is blocking, when revisions stop changing anything, when the two agents deadlock, or at a round cap.
-3. **You approve.** Nothing is built without a `y`.
-4. **Build in isolation.** Each task gets its own git worktree and branch. Tasks run in parallel only if they touch disjoint files.
-5. **Test and cross-review.** duo runs your test command, then the agent that did *not* write the code reviews the diff, plus any specialist lenses you enabled (security, UX, product).
-6. **Fix blockers.** Blocking findings go back to the builder for a bounded number of fix rounds.
-7. **Report and merge.** `REPORT.md` has scores, findings and every decision. `/merge` merges the branches and runs your tests on the result.
+| step | done by | result |
+|---|---|---|
+| plan | codex | `PLAN.md` and `plan.json` |
+| review | claude | issues tagged `blocking`, `should` or `nit` |
+| revise | codex | updated plan, one ledger entry per issue |
+| repeat | | until 0 blocking, no plan change, deadlock, or 3 rounds |
+| approve | you | `y` build · `n` stop · `e` edit the plan |
+| build | claude | one worktree and branch per task; tasks with disjoint files run in parallel (max 3) |
+| test | duo | your test command, e.g. `bun run test` |
+| review | codex | issues on the diff, plus optional security / ux / product lenses |
+| fix | claude | 1 round for `blocking` issues, then test and review again |
+| report | duo | `REPORT.md`: scores, findings, decisions |
+| merge | you | `/merge`: `--no-ff`, stops on conflict, runs tests on the result |
 
-Roles are configurable: either agent can plan or build. With only one agent installed, duo runs in solo mode.
+Roles can be swapped (`/flip`). With only one CLI installed, that CLI does every step.
+
+## Requirements
+
+- macOS or Linux, bash ≥ 3.2, git ≥ 2.5, jq ≥ 1.6
+- `claude` and/or `codex`, installed and logged in. duo shells out to them and makes no API calls of its own.
+- A clean working tree (untracked files are fine)
 
 ## Quick start
 
 ```bash
 npm install -g @electricmonkey/duo
 duo doctor
-cd your-repo && duo
+cd your-repo
+duo
 ```
 
 ```
@@ -67,7 +76,7 @@ duo › add rate limiting to the public API, 60 requests per minute per key
 ```
 
 > [!WARNING]
-> Early software. duo starts agents with write access to files. It never builds in your checkout and never merges without asking, but read the [threat model](#threat-model) before using it on code you care about.
+> duo runs agents with write access. Building happens in worktrees next to your repo, and nothing is merged until you run `/merge`. See [threat model](#threat-model).
 
 ---
 
@@ -237,7 +246,7 @@ $$T_{\text{wall}} = \max_k e_k - \min_k a_k$$
 
 $$T_{\text{serial}} \approx \sum_k (e_k - a_k) - (n - 1)\,\bar{s}$$
 
-The $(n-1)\,\bar{s}$ term exists because a serial run installs dependencies once, not once per task. Leaving it in would flatter the speedup, and nobody likes a benchmark that lies.
+The $(n-1)\,\bar{s}$ term is there because a serial run installs dependencies once, not once per task.
 
 $$\text{saved} = T_{\text{serial}} - T_{\text{wall}}, \qquad \text{speedup} = T_{\text{serial}} / T_{\text{wall}}$$
 
@@ -245,7 +254,7 @@ $$\text{saved} = T_{\text{serial}} - T_{\text{wall}}, \qquad \text{speedup} = T_
 
 $$\hat{T}_{\text{serial}} = n\,\bar{t}, \qquad \hat{T}_{\text{parallel}} = \left\lceil n / P' \right\rceil \bar{t}$$
 
-With no history, it prints the theoretical ceiling $n / \lceil n / P' \rceil$ and says so. Amdahl sends his regards.
+With no history, it prints the theoretical ceiling $n / \lceil n / P' \rceil$ and says so.
 
 The timeline column maps wall time onto 20 cells. Cell $k$ samples the phase active at $t_0 + \frac{(2k+1)\,\text{span}}{40}$:
 
@@ -257,7 +266,7 @@ The timeline column maps wall time onto 20 cells. Cell $k$ samples the phase act
 
 ## Lenses
 
-The normal review asks "is this correct?". Lenses ask "is this correct *for a security officer / a designer / the person who owns the product*?".
+A lens is an extra reviewer with a fixed checklist and its own definition of `blocking`.
 
 A lens is a markdown file with YAML-ish frontmatter and a checklist:
 
@@ -301,7 +310,7 @@ Plan lenses share the plan reviewer's call, so they cost tokens, not extra round
 
 ### Scores are derived, not vibed
 
-Language models are terrible at calibrated numbers; ask for a score out of ten and you get 7. So duo never asks for one. Each lens evaluates every checklist item as `pass`, `fail` or `n/a`, and duo computes
+Models give poorly calibrated numeric scores, so duo doesn't ask for one. Each lens evaluates every checklist item as `pass`, `fail` or `n/a`, and duo computes
 
 $$\text{score} = 10 \cdot \frac{\lvert \text{pass} \rvert}{\lvert \text{pass} \rvert + \lvert \text{fail} \rvert}$$
 
@@ -325,7 +334,7 @@ It stops at the first of:
 | ● deadlock | a re-raised finding was rejected by the builder |
 | ● stalled | the fix produced no diff |
 
-It's the plan loop's convergence logic, reapplied to code. Same ledger discipline, same deadlock rule, same "hand it to a human" exit.
+Same convergence rules as the plan loop, applied to code.
 
 ### Selecting lenses
 
@@ -372,7 +381,7 @@ npm install -g @electricmonkey/duo     # or: bun add -g @electricmonkey/duo
 duo doctor
 ```
 
-Requirements:
+Details on the requirements above:
 
 | | minimum | why |
 |---|---|---|
