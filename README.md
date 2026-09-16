@@ -20,7 +20,7 @@ duo › add input validation to the photo upload
 ## Install
 
 ```bash
-npm install -g @eletricmonkey/duo      # or: bun add -g @eletricmonkey/duo
+npm install -g @electricmonkey/duo      # or: bun add -g @electricmonkey/duo
 duo doctor                      # checks git, jq, claude, codex
 ```
 

@@ -14,7 +14,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -o pipefail
 VERSION="2.1.0"
-PKG="@eletricmonkey/duo"
+PKG="@electricmonkey/duo"
 
 # ── settings ────────────────────────────────────────────────────────────────
 KEYS="IMPL ROUNDS MIN_CHANGE PARALLEL SPLIT SETUP TEST ENV_COPY PLAN_ONLY"
