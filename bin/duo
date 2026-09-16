@@ -13,7 +13,7 @@
 #  Requires: git, jq, claude, codex.  Works with macOS bash 3.2.
 # ─────────────────────────────────────────────────────────────────────────────
 set -o pipefail
-VERSION="2.2.0"
+VERSION="2.2.1"
 PKG="@electricmonkey/duo"
 
 # ── settings ────────────────────────────────────────────────────────────────
@@ -84,11 +84,11 @@ banner() {
   local c1="" c2="" c3=""
   if (( TTY )); then c1="$ESC[38;5;213m"; c2="$ESC[38;5;141m"; c3="$ESC[38;5;81m"; fi
   echo
-  printf '  %s%s┌┬┐%s┬ ┬%s┌─┐%s   %sduo%s %sv%s%s\n' "$BOLD" "$c1" "$c2" "$c3" "$RST" "$BOLD" "$RST" "$DIM" "$VERSION" "$RST"
-  printf '  %s%s ││%s│ │%s│ │%s   %scodex plans · claude reviews · worktrees build%s\n' "$BOLD" "$c1" "$c2" "$c3" "$RST" "$DIM" "$RST"
-  printf '  %s%s─┴┘%s└─┘%s└─┘%s   %s%s%s · %s · %s builds · %s rounds · split %s%s\n' "$BOLD" "$c1" "$c2" "$c3" "$RST" \
-    "$DIM" "$RST$BOLD" "$REPO" "$RST$DIM$(git branch --show-current)" "$IMPL" "$ROUNDS" "$SPLIT" "$RST"
-  printf '\n  %stype a task · /help for commands · ctrl-c to quit%s\n\n' "$DIM" "$RST"
+  printf '  %s█▀▄ %s█ █ %s█▀█%s   %sduo%s %sv%s%s\n' "$c1" "$c2" "$c3" "$RST" "$BOLD" "$RST" "$DIM" "$VERSION" "$RST"
+  printf '  %s█ █ %s█ █ %s█ █%s   %scodex plans · claude reviews · worktrees build%s\n' "$c1" "$c2" "$c3" "$RST" "$DIM" "$RST"
+  printf '  %s▀▀  %s▀▀▀ %s▀▀▀%s   %s%s%s%s · %s · %s builds · %s rounds · split %s%s\n' "$c1" "$c2" "$c3" "$RST" \
+    "$BOLD" "$REPO" "$RST" "$DIM" "$(git branch --show-current)" "$IMPL" "$ROUNDS" "$SPLIT" "$RST"
+  printf '\n  %sdescribe what you want built, in plain words · /help for commands · ctrl-c to quit%s\n\n' "$DIM" "$RST"
 }
 
 # ── environment detection ───────────────────────────────────────────────────
@@ -829,14 +829,48 @@ slash() { # returns 1 to quit
   return 0
 }
 
+# ── hints ───────────────────────────────────────────────────────────────────
+EXAMPLES=(
+  "fix: photo upload fails silently when the file is over 10 MB — show an error"
+  "add unit tests for src/lib/date.ts, cover time zones and invalid input"
+  "add e2e smoke tests for login and dashboard, one spec file each"
+  "refactor the webhook handler into smaller functions, no behaviour change"
+  "add a loading skeleton to the orders page"
+  "add rate limiting to the public API, 60 requests per minute per key"
+)
+TIPS=(
+  "good tasks say what done looks like: the behaviour, the files, the edge cases"
+  "/planonly on — see the plan without building anything"
+  "/split prefer — nudge the planner towards parallel tasks"
+  "/impl codex — let codex build and claude review the code"
+  "/rounds 2 — cap the plan/review loop"
+  "↑ recalls earlier tasks · /runs shows past runs"
+  "tasks that each create their own files split best; a shared translation file forces serial"
+)
+HINT_N=0
+
+hint() {
+  local i
+  if (( ! TTY )); then return; fi
+  if (( HINT_N % 2 == 0 )); then
+    i=$(( RANDOM % ${#EXAMPLES[@]} ))
+    printf '  %stry  %s"%s"%s\n' "$DIM" "$RST$DIM" "${EXAMPLES[i]}" "$RST"
+  else
+    i=$(( RANDOM % ${#TIPS[@]} ))
+    printf '  %stip  %s%s\n' "$DIM" "${TIPS[i]}" "$RST"
+  fi
+  HINT_N=$((HINT_N + 1))
+}
+
 # ── REPL ────────────────────────────────────────────────────────────────────
 repl() {
-  local line rc PROMPT HIST="$CFG_DIR/history"
+  local line rc PROMPT HIST="$CFG_DIR/history" LAST_WAS_SLASH=0
   banner
   mkdir -p "$CFG_DIR"; touch "$HIST"
   set -o history; history -r "$HIST" 2>/dev/null
   PROMPT=$'\001'"$BOLD$MAG"$'\002''duo'$'\001'"$RST$DIM"$'\002'' › '$'\001'"$RST"$'\002'
   while :; do
+    if [[ "$LAST_WAS_SLASH" != 1 ]]; then hint; fi
     trap 'printf "\n"; note "bye"; exit 0' INT
     IFS= read -e -r -p "$PROMPT" line; rc=$?
     trap - INT
@@ -845,7 +879,9 @@ repl() {
     line="${line%"${line##*[![:space:]]}"}"
     if [[ -z "$line" ]]; then continue; fi
     history -s "$line"; history -w "$HIST" 2>/dev/null
+    LAST_WAS_SLASH=0
     if [[ "$line" == /* ]]; then
+      LAST_WAS_SLASH=1
       slash "$line" || break
     else
       run_task "$line"

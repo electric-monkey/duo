@@ -1,6 +1,6 @@
 {
   "name": "@electricmonkey/duo",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Codex plans, Claude reviews, git worktrees build — a converging plan/review loop for coding agents",
   "bin": {
     "duo": "bin/duo"
