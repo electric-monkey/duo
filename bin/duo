@@ -13,17 +13,18 @@
 #  Requires: git, jq, claude, codex.  Works with macOS bash 3.2.
 # ─────────────────────────────────────────────────────────────────────────────
 set -o pipefail
-VERSION="2.2.1"
+VERSION="2.4.0"
 PKG="@electricmonkey/duo"
 
 # ── settings ────────────────────────────────────────────────────────────────
-KEYS="IMPL ROUNDS MIN_CHANGE PARALLEL SPLIT SETUP TEST ENV_COPY PLAN_ONLY"
+KEYS="PLANNER IMPL ROUNDS MIN_CHANGE PARALLEL SPLIT SETUP TEST ENV_COPY PLAN_ONLY LENSES FIX_ROUNDS"
 ENV_IMPL="${IMPL:-}"; ENV_MAX_ROUNDS="${MAX_ROUNDS:-}"
 ENV_SETUP_CMD="${SETUP_CMD:-}"; ENV_MAX_PARALLEL="${MAX_PARALLEL:-}"
 
 set_defaults() {
-  IMPL=claude; ROUNDS=3; MIN_CHANGE=5; PARALLEL=3; SPLIT=auto
+  PLANNER=codex; IMPL=claude; ROUNDS=3; MIN_CHANGE=5; PARALLEL=3; SPLIT=auto
   SETUP=auto; TEST=auto; ENV_COPY=on; PLAN_ONLY=off
+  LENSES=""; FIX_ROUNDS=1
 }
 
 CFG_DIR="$HOME/.config/duo"
@@ -35,6 +36,12 @@ load_cfg() {
   while IFS='=' read -r k v || [[ -n "$k" ]]; do
     case " $KEYS " in *" $k "*) printf -v "$k" '%s' "$v" ;; esac
   done < "$f"
+}
+
+set_cfg_key() { # file key value — update one line, keep the rest
+  local f="$1"
+  mkdir -p "$(dirname "$f")"; touch "$f"
+  awk -v k="$2" -v v="$3" -F= '$1 == k { print k "=" v; d = 1; next } { print } END { if (!d) print k "=" v }' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 }
 
 save_cfg() {
@@ -79,15 +86,20 @@ other(){ if [[ "$1" == claude ]]; then echo codex; else echo claude; fi; }
 step_line() { # icon label who seconds detail
   printf '  %s %-13s %s%-7s %7s%s  %s\n' "$1" "$2" "$DIM" "$3" "$(fmt_t "$4")" "$RST" "$5"
 }
-
 banner() {
-  local c1="" c2="" c3=""
+  local c1="" c2="" c3="" roles
+  resolve_roles
   if (( TTY )); then c1="$ESC[38;5;213m"; c2="$ESC[38;5;141m"; c3="$ESC[38;5;81m"; fi
+  roles="$P_AGENT plans · $R_AGENT reviews · $B_AGENT builds"
   echo
   printf '  %s█▀▄ %s█ █ %s█▀█%s   %sduo%s %sv%s%s\n' "$c1" "$c2" "$c3" "$RST" "$BOLD" "$RST" "$DIM" "$VERSION" "$RST"
-  printf '  %s█ █ %s█ █ %s█ █%s   %scodex plans · claude reviews · worktrees build%s\n' "$c1" "$c2" "$c3" "$RST" "$DIM" "$RST"
-  printf '  %s▀▀  %s▀▀▀ %s▀▀▀%s   %s%s%s%s · %s · %s builds · %s rounds · split %s%s\n' "$c1" "$c2" "$c3" "$RST" \
-    "$BOLD" "$REPO" "$RST" "$DIM" "$(git branch --show-current)" "$IMPL" "$ROUNDS" "$SPLIT" "$RST"
+  printf '  %s█ █ %s█ █ %s█ █%s   %s%s%s\n' "$c1" "$c2" "$c3" "$RST" "$DIM" "$roles" "$RST"
+  printf '  %s▀▀  %s▀▀▀ %s▀▀▀%s   %s%s%s%s · %s · %s rounds · split %s · parallel %s · lenses %s%s\n' "$c1" "$c2" "$c3" "$RST" \
+    "$BOLD" "$REPO" "$RST" "$DIM" "$(git branch --show-current)" "$ROUNDS" "$SPLIT" "$PARALLEL" "${LENSES:-none}" "$RST"
+  if (( SOLO )); then
+    printf '\n  %s! solo mode%s %sonly %s is installed, so it reviews its own work with a fresh context. Install %s for cross-model review.%s\n' \
+      "$YLW" "$RST" "$DIM" "$P_AGENT" "$(other "$P_AGENT")" "$RST"
+  fi
   printf '\n  %sdescribe what you want built, in plain words · /help for commands · ctrl-c to quit%s\n\n' "$DIM" "$RST"
 }
 
@@ -124,6 +136,50 @@ resolve_test() {
         echo "$pm run test"
       fi ;;
     *) echo "$TEST" ;;
+  esac
+}
+
+# ── roles ───────────────────────────────────────────────────────────────────
+have_agent() { command -v "$1" >/dev/null 2>&1; }
+available_agents() { local a; for a in codex claude; do if have_agent "$a"; then echo "$a"; fi; done; }
+pick_agent() { # preferred → preferred if installed, else the other one
+  if have_agent "$1"; then echo "$1"; else other "$1"; fi
+}
+opposite() { # the other agent if installed, else the same one (solo)
+  if have_agent "$(other "$1")"; then other "$1"; else echo "$1"; fi
+}
+resolve_roles() {
+  P_AGENT="$(pick_agent "$PLANNER")"; R_AGENT="$(opposite "$P_AGENT")"
+  B_AGENT="$(pick_agent "$IMPL")";    REVIEWER="$(opposite "$B_AGENT")"
+  SOLO=0
+  if [[ "$P_AGENT" == "$R_AGENT" ]]; then SOLO=1; fi
+  SOLO_NOTE=""
+  if (( SOLO )); then
+    SOLO_NOTE="You are an independent reviewer with a fresh context. You did not write this work and have no reason to defend it. Be skeptical."
+  fi
+}
+
+run_limited() { # seconds cmd... → runs with a time limit, stdin closed
+  local secs="$1" pid i=0; shift
+  "$@" </dev/null >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( i >= secs * 5 )); then kill_tree "$pid"; return 124; fi
+    sleep 0.2; i=$((i + 1))
+  done
+  wait "$pid"
+}
+
+login_state() { # agent → yes | no | unknown
+  case "$1" in
+    codex)
+      if codex login --help 2>/dev/null | grep -q status; then
+        if run_limited 8 codex login status; then echo yes; else echo no; fi
+      else echo unknown; fi ;;
+    claude)
+      if claude --help 2>/dev/null | grep -qE '^ +auth\b'; then
+        if run_limited 8 claude auth status; then echo yes; else echo no; fi
+      else echo unknown; fi ;;
   esac
 }
 
@@ -180,11 +236,261 @@ run_step() { # run_step <label> <who> <log> <prompt>; sets STEP_T
   return $rc
 }
 
+# ── lenses ──────────────────────────────────────────────────────────────────
+lens_dirs() {
+  echo "$(dirname "$(dirname "$(script_path)")")/lenses"
+  echo "$CFG_DIR/lenses"
+  echo "$ROOT/duo-lenses"
+}
+lens_file() { # later directories override earlier ones
+  local d f=""
+  while read -r d; do
+    if [[ -f "$d/$1.md" ]]; then f="$d/$1.md"; fi
+  done < <(lens_dirs)
+  echo "$f"
+}
+lens_names() {
+  local d f
+  while read -r d; do
+    for f in "$d"/*.md; do
+      if [[ -f "$f" ]]; then basename "$f" .md; fi
+    done
+  done < <(lens_dirs) | awk '!seen[$0]++'
+}
+lens_meta() { # file key
+  awk -v k="$2" 'NR == 1 && $0 != "---" { exit }
+    NR > 1 && $0 == "---" { exit }
+    NR > 1 { i = index($0, ":"); if (substr($0, 1, i - 1) == k) { v = substr($0, i + 1); sub(/^ +/, "", v); print v; exit } }' "$1"
+}
+lens_body() { awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm' "$1"; }
+enabled_lenses() { # $1 = plan|code → enabled lens names for that phase
+  local l f ph
+  for l in $(echo "$LENSES" | tr ',' ' '); do
+    f="$(lens_file "$l")"
+    if [[ -z "$f" ]]; then continue; fi
+    ph="$(lens_meta "$f" phase)"
+    if [[ "$ph" == both || "$ph" == "$1" ]]; then echo "$l"; fi
+  done
+}
+
+JQ_SCORE='def score: ([.checks[]? | select(.result == "pass")] | length) as $p
+  | ([.checks[]? | select(.result == "fail")] | length) as $f
+  | if ($p + $f) == 0 then "–" else ((($p * 100 / ($p + $f)) | round) / 10 | tostring) end;'
+
+color_score() { # "7.5" → colored
+  case "$1" in
+    –|"") printf '%s–%s' "$DIM" "$RST" ;;
+    10|9*|8*) printf '%s%s%s' "$GRN" "$1" "$RST" ;;
+    7*|6*|5*) printf '%s%s%s' "$YLW" "$1" "$RST" ;;
+    *) printf '%s%s%s' "$RED" "$1" "$RST" ;;
+  esac
+}
+
+lens_picker_plain() {
+  local names=() sel=() i n line tok f
+  while read -r n; do names[${#names[@]}]="$n"; done < <(lens_names)
+  if (( ${#names[@]} == 0 )); then warn "no lenses found in: $(lens_dirs | tr '\n' ' ')"; return 1; fi
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    case ",$LENSES," in *",${names[i]},"*) sel[i]=1 ;; *) sel[i]=0 ;; esac
+  done
+  while :; do
+    echo
+    printf '  %slenses%s  %sspecialist reviewers that run alongside the normal review%s\n' "$BOLD" "$RST" "$DIM" "$RST"
+    for ((i = 0; i < ${#names[@]}; i++)); do
+      f="$(lens_file "${names[i]}")"
+      if (( sel[i] )); then n="${GRN}[x]${RST}"; else n="${DIM}[ ]${RST}"; fi
+      printf '  %s┃%s %d %s %-10s %s%-5s %s%s\n' "$MAG" "$RST" $((i + 1)) "$n" "${names[i]}" \
+        "$DIM" "$(lens_meta "$f" phase)" "$(lens_meta "$f" summary)" "$RST"
+    done
+    printf '  %s┃%s   %sblocking findings are fixed automatically, up to %s round(s) · /fixrounds N%s\n' "$MAG" "$RST" "$DIM" "$FIX_ROUNDS" "$RST"
+    printf '\n  %s›%s numbers to toggle %s(e.g. 1 3)%s · enter to accept · 0 for none: ' "$MAG" "$RST" "$DIM" "$RST"
+    IFS= read -r line || break
+    if [[ -z "$line" ]]; then break; fi
+    for tok in $line; do
+      if [[ "$tok" == 0 ]]; then
+        for ((i = 0; i < ${#names[@]}; i++)); do sel[i]=0; done
+      elif [[ "$tok" =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= ${#names[@]} )); then
+        sel[tok - 1]=$(( 1 - sel[tok - 1] ))
+      fi
+    done
+  done
+  LENSES=""
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    if (( sel[i] )); then LENSES="${LENSES:+$LENSES,}${names[i]}"; fi
+  done
+  ok "lenses → ${LENSES:-none}"
+}
+
+# ── settings menu (arrow keys) ──────────────────────────────────────────────
+SPLITS=(auto prefer off)
+
+menu_draw() { # $1 = 1 on first draw
+  local i f mark cur lbl val desc
+  if [[ "$1" != 1 ]]; then printf '%s[%sA' "$ESC" "$MENU_LINES"; fi
+  printf '\r%s  %slenses%s  %sspecialist reviewers that run alongside the normal review%s\n' "$CLR" "$BOLD" "$RST" "$DIM" "$RST"
+  for ((i = 0; i < M_NL; i++)); do
+    f="$(lens_file "${M_NAMES[i]}")"
+    if (( M_SEL[i] )); then mark="${GRN}◉${RST}"; else mark="${DIM}○${RST}"; fi
+    if (( i == M_CUR )); then cur="${MAG}❯${RST}"; lbl="$BOLD${M_NAMES[i]}$RST"; else cur=" "; lbl="${M_NAMES[i]}"; fi
+    printf '\r%s  %s %s %s%*s %s%-5s %s%s\n' "$CLR" "$cur" "$mark" "$lbl" $((11 - ${#M_NAMES[i]})) "" \
+      "$DIM" "$(lens_meta "$f" phase)" "$(lens_meta "$f" summary)" "$RST"
+  done
+  printf '\r%s\n' "$CLR"
+  printf '\r%s  %ssettings%s\n' "$CLR" "$BOLD" "$RST"
+  for ((i = 0; i < 5; i++)); do
+    case $i in
+      0) lbl="planner";    val="$M_PLAN";            desc="writes the plan · $(opposite "$M_PLAN") reviews it" ;;
+      1) lbl="builder";    val="$M_IMPL";            desc="writes the code · $(opposite "$M_IMPL") reviews it" ;;
+      2) lbl="split";      val="${SPLITS[M_SPLIT]}"; desc="how eager the planner is to split work into parallel tasks" ;;
+      3) lbl="parallel";   val="$M_PAR";             desc="max worktrees building at once" ;;
+      4) lbl="fix rounds"; val="$M_FIX";             desc="auto-fix rounds for blocking findings (0 = off)" ;;
+    esac
+    if [[ $i -le 1 && -z "$(have_agent codex && have_agent claude && echo both)" ]]; then desc="$desc ${YLW}(solo: only $val installed)${RST}$DIM"; fi
+    if (( M_CUR == M_NL + i )); then
+      printf '\r%s  %s❯%s %s%-11s%s %s‹%s %s%-6s%s %s›%s %s%s%s\n' "$CLR" "$MAG" "$RST" "$BOLD" "$lbl" "$RST" "$MAG" "$RST" "$BOLD" "$val" "$RST" "$MAG" "$RST" "$DIM" "$desc" "$RST"
+    else
+      printf '\r%s    %-11s   %-6s   %s%s%s\n' "$CLR" "$lbl" "$val" "$DIM" "$desc" "$RST"
+    fi
+  done
+  printf '\r%s\n' "$CLR"
+  printf '\r%s  %s↑↓ move · space toggle · ←→ change · a all lenses · enter save · q cancel%s\n' "$CLR" "$DIM" "$RST"
+}
+
+menu_change() { # $1 = +1 | -1 | t (toggle)
+  local i=$M_CUR
+  if (( i < M_NL )); then
+    case "$1" in
+      +1) M_SEL[i]=1 ;;
+      -1) M_SEL[i]=0 ;;
+      *)  M_SEL[i]=$(( 1 - M_SEL[i] )) ;;
+    esac
+    return
+  fi
+  local d=1
+  if [[ "$1" == -1 ]]; then d=-1; fi
+  case $((i - M_NL)) in
+    0) M_PLAN="$(opposite "$M_PLAN")" ;;
+    1) M_IMPL="$(opposite "$M_IMPL")" ;;
+    2) M_SPLIT=$(( (M_SPLIT + d + 3) % 3 )) ;;
+    3) M_PAR=$(( M_PAR + d )); if (( M_PAR < 1 )); then M_PAR=$([[ "$1" == t ]] && echo 8 || echo 1); fi
+       if (( M_PAR > 8 )); then M_PAR=$([[ "$1" == t ]] && echo 1 || echo 8); fi ;;
+    4) M_FIX=$(( M_FIX + d )); if (( M_FIX < 0 )); then M_FIX=0; fi
+       if (( M_FIX > 3 )); then M_FIX=$([[ "$1" == t ]] && echo 0 || echo 3); fi ;;
+  esac
+}
+
+lens_picker() { # interactive settings menu; returns 1 if cancelled
+  if (( ! TTY )) || [[ ! -t 0 ]]; then lens_picker_plain; return; fi
+  local n i key rest total all
+  M_NAMES=(); M_SEL=(); M_CUR=0
+  while read -r n; do M_NAMES[${#M_NAMES[@]}]="$n"; done < <(lens_names)
+  M_NL=${#M_NAMES[@]}
+  for ((i = 0; i < M_NL; i++)); do
+    case ",$LENSES," in *",${M_NAMES[i]},"*) M_SEL[i]=1 ;; *) M_SEL[i]=0 ;; esac
+  done
+  M_SPLIT=0
+  for ((i = 0; i < 3; i++)); do if [[ "${SPLITS[i]}" == "$SPLIT" ]]; then M_SPLIT=$i; fi; done
+  M_PAR="$PARALLEL"; M_FIX="$FIX_ROUNDS"
+  M_PLAN="$(pick_agent "$PLANNER")"; M_IMPL="$(pick_agent "$IMPL")"
+  total=$((M_NL + 5))
+  MENU_LINES=$((M_NL + 10))
+
+  echo
+  printf '%s[?25l' "$ESC"
+  trap 'printf "%s[?25h\n" "$ESC"; note "bye"; exit 0' INT
+  menu_draw 1
+  while :; do
+    IFS= read -rsn1 key
+    if [[ "$key" == $'\033' ]]; then
+      rest=""; IFS= read -rsn2 -t 1 rest
+      key="$key$rest"
+    fi
+    case "$key" in
+      $'\033[A'|$'\033OA'|k) M_CUR=$(( (M_CUR - 1 + total) % total )) ;;
+      $'\033[B'|$'\033OB'|j) M_CUR=$(( (M_CUR + 1) % total )) ;;
+      $'\033[C'|$'\033OC'|l) menu_change +1 ;;
+      $'\033[D'|$'\033OD'|h) menu_change -1 ;;
+      " ") menu_change t ;;
+      a|A)
+        all=1
+        for ((i = 0; i < M_NL; i++)); do if (( ! M_SEL[i] )); then all=0; fi; done
+        for ((i = 0; i < M_NL; i++)); do M_SEL[i]=$(( 1 - all )); done ;;
+      "") break ;;
+      q|Q|$'\033')
+        printf '%s[?25h' "$ESC"; trap - INT
+        note "cancelled — nothing changed"; return 1 ;;
+    esac
+    menu_draw 0
+  done
+  printf '%s[?25h' "$ESC"; trap - INT
+
+  LENSES=""
+  for ((i = 0; i < M_NL; i++)); do
+    if (( M_SEL[i] )); then LENSES="${LENSES:+$LENSES,}${M_NAMES[i]}"; fi
+  done
+  SPLIT="${SPLITS[M_SPLIT]}"; PARALLEL="$M_PAR"; FIX_ROUNDS="$M_FIX"
+  PLANNER="$M_PLAN"; IMPL="$M_IMPL"
+  ok "$PLANNER plans · $IMPL builds · lenses ${LENSES:-none} · split $SPLIT · parallel $PARALLEL · fix rounds $FIX_ROUNDS"
+}
+
+set_lenses() { # /lenses a,b | off
+  local l bad=""
+  if [[ "$1" == off || "$1" == none ]]; then LENSES=""; ok "lenses → none"; return; fi
+  for l in $(echo "$1" | tr ', ' '  '); do
+    if [[ -z "$(lens_file "$l")" ]]; then bad="$bad $l"; fi
+  done
+  if [[ -n "$bad" ]]; then fail "unknown lens:$bad — available: $(lens_names | tr '\n' ' ')"; return; fi
+  LENSES="$(echo "$1" | tr ' ' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')"
+  ok "lenses → $LENSES"
+}
+
+onboard() {
+  if (( ! TTY )) || [[ -f "$CFG_DIR/onboarded" ]]; then return; fi
+  printf '  %swelcome to duo%s  %sone-time setup · change it later with /settings%s\n' "$BOLD" "$RST" "$DIM" "$RST"
+  if lens_picker; then
+    set_cfg_key "$GLOBAL_CFG" LENSES "$LENSES"
+    set_cfg_key "$GLOBAL_CFG" FIX_ROUNDS "$FIX_ROUNDS"
+    set_cfg_key "$GLOBAL_CFG" SPLIT "$SPLIT"
+    set_cfg_key "$GLOBAL_CFG" PARALLEL "$PARALLEL"
+    set_cfg_key "$GLOBAL_CFG" PLANNER "$PLANNER"
+    set_cfg_key "$GLOBAL_CFG" IMPL "$IMPL"
+    note "saved as your global default"
+  fi
+  mkdir -p "$CFG_DIR"; touch "$CFG_DIR/onboarded"
+  echo
+}
+
 # ── prompts ─────────────────────────────────────────────────────────────────
 NO_CODE="Do NOT modify any source code in this step."
 PLAN_SCHEMA='{"summary":"string","parallel":true,"reason":"string","tasks":[{"id":"kebab-case","title":"string","instructions":"string","files":["path"]}]}'
 SEVERITY='Severity: blocking = the plan/code would produce a wrong or broken result; should = real but non-fatal; nit = style or preference. Be strict: most things are NOT blocking.'
 INDEPENDENCE='Tasks are independent only if they touch disjoint files, share no changed interfaces/types/config/migrations/lockfiles/translation files/test fixtures, have no ordering dependency, and can each be tested on their own.'
+
+plan_lens_block() {
+  local l f out=""
+  for l in $(enabled_lenses plan); do
+    f="$(lens_file "$l")"
+    out="$out
+### Lens: $l — $(lens_meta "$f" title)
+$(lens_body "$f")
+Blocking for this lens means: $(lens_meta "$f" blocking)
+"
+  done
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "Also review the plan through these specialist lenses. Tag every issue with
+\"lens\" (use \"general\" for the normal review). For each lens, evaluate EVERY
+checklist item as pass, fail or n/a and report it under \"lenses\".
+$out"
+  fi
+}
+
+plan_review_shape() { # $1 = round
+  local lenses=""
+  if [[ -n "$(enabled_lenses plan)" ]]; then
+    lenses=',"lenses":[{"name":"<lens>","checks":[{"item":"...","result":"pass|fail|n/a","note":"..."}]}]'
+  fi
+  printf '%s' "{\"issues\":[{\"id\":\"R$1-1\",\"lens\":\"general\",\"severity\":\"blocking|should|nit\",\"claim\":\"...\",\"evidence\":\"file:line or concrete reason\",\"reraised\":false}]$lenses}"
+}
 
 split_rule() {
   case "$SPLIT" in
@@ -213,6 +519,16 @@ plan_card() {
   if [[ "$st" != converged && -f "$last" ]]; then
     jq -r '.issues[] | select(.severity == "blocking") | "\(.id)\u001f\(.claim)"' "$last" |
       while IFS="$US" read -r id c; do bar "  ${RED}●${RST} $id ${DIM}$c${RST}"; done
+  fi
+  if [[ -f "$last" ]] && jq -e '(.lenses // []) | length > 0' "$last" >/dev/null 2>&1; then
+    local lline=""
+    while IFS=$'\x1f' read -r ln sc nb; do
+      lline="$lline$ln $(color_score "$sc")"
+      if (( nb > 0 )); then lline="$lline ${RED}●$nb${RST}"; fi
+      lline="$lline   "
+    done < <(jq -r "$JQ_SCORE"' . as $r | .lenses[] | .name as $n
+      | "\($n)\u001f\(score)\u001f\([$r.issues[] | select(.lens == $n and .severity == "blocking")] | length)"' "$last")
+    bar "${DIM}lenses${RST}  $lline"
   fi
   if [[ "$par" == true ]]; then
     bar "${CYN}⇉ parallel${RST} ${DIM}$(jq -r '.reason' "$run/plan.json")${RST}"
@@ -273,7 +589,7 @@ gate() {
     plan_card "$RUN"
     if [[ "$PLAN_ONLY" == on ]]; then note "plan-only mode — stopping here (/planonly off to build)"; return 1; fi
     printf '\n  %s›%s build with %s%s%s, review by %s? %s[y]es · [p]lan · [e]dit · [n]o%s ' \
-      "$MAG" "$RST" "$BOLD" "$IMPL" "$RST" "$(other "$IMPL")" "$DIM" "$RST"
+      "$MAG" "$RST" "$BOLD" "$B_AGENT" "$RST" "$REVIEWER" "$DIM" "$RST"
     trap ':' INT
     read -rsn1 key || key=n
     trap - INT
@@ -299,13 +615,98 @@ setst()   { echo "$2" > "$RUN/state-$1"; }
 
 mark() { echo "$2 $(date +%s)" >> "$RUN/times-$1"; }
 
+round_note() { # source round
+  if (( $2 > 1 )); then
+    echo "This is re-review round $2, after fixes. Read .duo-fixlog.json (decisions on earlier
+findings) and the latest fix (git show HEAD). Do NOT re-raise a settled finding without
+NEW evidence; if you do, reuse its id and set reraised=true.
+New findings get ids $1-$2-1, $1-$2-2, ..."
+  else
+    echo "Findings get ids $1-1-1, $1-1-2, ..."
+  fi
+}
+
+review_prompt() { # source round
+  local f
+  if [[ "$1" == code ]]; then
+    printf '%s\n' "Review the diff in .duo-diff.patch against the task in .duo-task.md and the
+plan in .duo-plan.md. $TNOTE $SOLO_NOTE
+$(round_note code "$2")
+$SEVERITY
+Write .duo-review-code.json, valid JSON only:
+{\"issues\":[{\"id\":\"code-$2-1\",\"severity\":\"blocking|should|nit\",\"claim\":\"...\",\"evidence\":\"file:line\",\"reraised\":false}]}
+$NO_CODE"
+  else
+    f="$(lens_file "$1")"
+    printf '%s\n' "You are reviewing a code change as: $(lens_meta "$f" title).
+
+$(lens_body "$f")
+
+Review the diff in .duo-diff.patch against the task in .duo-task.md and the
+plan in .duo-plan.md. $TNOTE $SOLO_NOTE
+$(round_note "$1" "$2")
+Evaluate EVERY checklist item above as pass, fail or n/a.
+Severity: blocking = $(lens_meta "$f" blocking); should = real but non-fatal; nit = preference. Be strict: most things are NOT blocking.
+Write .duo-review-$1.json, valid JSON only:
+{\"lens\":\"$1\",\"checks\":[{\"item\":\"...\",\"result\":\"pass|fail|n/a\",\"note\":\"...\"}],\"issues\":[{\"id\":\"$1-$2-1\",\"severity\":\"blocking|should|nit\",\"claim\":\"...\",\"evidence\":\"file:line\",\"reraised\":false}]}
+$NO_CODE"
+  fi
+}
+
+run_tests() { # $1 = id; sets TNOTE
+  local rc
+  TNOTE="No test command was run."
+  if [[ -z "$TEST_CMD_R" ]]; then return; fi
+  setst "$1" testing; mark "$1" test
+  bash -c "$TEST_CMD_R" > .duo-test.log 2>&1; rc=$?
+  cat .duo-test.log >> "$RUN/test-$1.log"
+  if (( rc == 0 )); then echo pass > "$RUN/tests-$1"; TNOTE="Tests ($TEST_CMD_R) PASSED."
+  else echo fail > "$RUN/tests-$1"; TNOTE="Tests ($TEST_CMD_R) FAILED — see .duo-test.log."; fi
+}
+
+commit_work() { # id message → 0 if something was committed
+  git add -A
+  if [[ -n "$COPIED" ]]; then git reset -q -- $COPIED 2>/dev/null; fi
+  git commit -qm "$2" >/dev/null 2>&1
+}
+
+review_round() { # id round sources
+  local id="$1" r="$2" src
+  for src in $3; do
+    rm -f ".duo-review-$src.json"
+    ( agent "$REVIEWER" "$(review_prompt "$src" "$r")" > "$RUN/review-$id-$src-r$r.log" 2>&1
+      if jq -e '.issues' ".duo-review-$src.json" >/dev/null 2>&1; then
+        cp ".duo-review-$src.json" "$RUN/review-$id-$src-r$r.json"
+      fi ) &
+  done
+  wait
+}
+
+collect_blockers() { # → .duo-blockers.json, NB, NEXT_SOURCES
+  local src f
+  NEXT_SOURCES=""
+  echo '[]' > .duo-blockers.json
+  for src in $ALL_SOURCES; do
+    f=".duo-review-$src.json"
+    jq -e '.issues' "$f" >/dev/null 2>&1 || continue
+    if jq -e '[.issues[] | select(.severity == "blocking")] | length > 0' "$f" >/dev/null; then
+      NEXT_SOURCES="$NEXT_SOURCES $src"
+      jq --arg s "$src" --slurpfile B .duo-blockers.json \
+        '$B[0] + [.issues[] | select(.severity == "blocking") | . + {source: $s}]' "$f" > .duo-b.tmp \
+        && mv .duo-b.tmp .duo-blockers.json
+    fi
+  done
+  NB="$(jq 'length' .duo-blockers.json)"
+}
+
 work() {
-  local id="$1" wt f copied="" rc
+  local id="$1" wt f r=1 fixr=0 outcome=clean sources dead
   wt="$(wt_path "$id")"
   cd "$wt" || { setst "$id" failed; mark "$id" end; return; }
+  COPIED=""
   if [[ "$ENV_COPY" == on ]]; then
     for f in "$ROOT"/.env*; do
-      if [[ -f "$f" ]]; then cp "$f" . && copied="$copied $(basename "$f")"; fi
+      if [[ -f "$f" ]]; then cp "$f" . && COPIED="$COPIED $(basename "$f")"; fi
     done
   fi
   if [[ -n "$SETUP_CMD_R" ]]; then
@@ -314,34 +715,49 @@ work() {
   fi
 
   setst "$id" building; mark "$id" build
-  agent "$IMPL" "Read .duo-plan.md for context. Implement ONLY the task in
+  agent "$B_AGENT" "Read .duo-plan.md for context. Implement ONLY the task in
 .duo-task.md. Touch only the files that task needs. Do not commit." > "$RUN/impl-$id.log" 2>&1
-
-  git add -A
-  if [[ -n "$copied" ]]; then git reset -q -- $copied 2>/dev/null; fi
-  if ! git commit -qm "duo($id): $(head -1 .duo-task.md | sed 's/^# //')" >/dev/null 2>&1; then
+  if ! commit_work "$id" "duo($id): $(head -1 .duo-task.md | sed 's/^# //')"; then
     setst "$id" "no changes"; mark "$id" end; return
   fi
-  git diff "$BASE...HEAD" > .duo-diff.patch
+  run_tests "$id"
 
-  local tnote="No test command was run."
-  if [[ -n "$TEST_CMD_R" ]]; then
-    setst "$id" testing; mark "$id" test
-    bash -c "$TEST_CMD_R" > .duo-test.log 2>&1; rc=$?
-    cp .duo-test.log "$RUN/test-$id.log"
-    if (( rc == 0 )); then echo pass > "$RUN/tests-$id"; tnote="Tests ($TEST_CMD_R) PASSED."
-    else echo fail > "$RUN/tests-$id"; tnote="Tests ($TEST_CMD_R) FAILED — see .duo-test.log."; fi
-  fi
+  echo '[]' > .duo-fixlog.json
+  sources="$ALL_SOURCES"
+  while :; do
+    setst "$id" reviewing; mark "$id" review
+    git diff "$BASE...HEAD" > .duo-diff.patch
+    review_round "$id" "$r" "$sources"
+    collect_blockers
+    if (( NB == 0 )); then outcome=clean; break; fi
+    dead="$(jq -r --slurpfile L .duo-fixlog.json '
+      [ $L[0][] | select(.decision == "rejected") | .id ] as $rej
+      | [ .[] | select(.reraised == true) | .id | select(IN($rej[])) ] | join(" ")' .duo-blockers.json)"
+    if [[ -n "$dead" ]]; then outcome="deadlock"; echo "$dead" > "$RUN/dead-$id"; break; fi
+    if (( fixr >= FIX_ROUNDS )); then outcome=cap; break; fi
 
-  setst "$id" reviewing; mark "$id" review
-  agent "$REVIEWER" "Review the diff in .duo-diff.patch against the task in
-.duo-task.md and the plan in .duo-plan.md. $tnote
-$SEVERITY
-Write .duo-review.json, valid JSON only:
-{\"issues\":[{\"id\":\"C-1\",\"severity\":\"blocking|should|nit\",\"claim\":\"...\",\"evidence\":\"file:line\"}]}
-$NO_CODE" > "$RUN/codereview-$id.log" 2>&1
-  cp .duo-review.json "$RUN/codereview-$id.json" 2>/dev/null
-  setst "$id" done; mark "$id" end
+    fixr=$((fixr + 1))
+    setst "$id" fixing; mark "$id" fix
+    agent "$B_AGENT" "Fix ONLY the blocking review findings listed in .duo-blockers.json.
+Context: the task is in .duo-task.md and the plan in .duo-plan.md. $TNOTE
+Change only what each finding requires; do not refactor or widen scope.
+For EACH finding append one entry to the JSON array in .duo-fixlog.json:
+{\"id\":\"<finding id>\",\"decision\":\"fixed|rejected\",\"reason\":\"one line\",\"round\":$fixr}
+Reject only with a concrete, checkable reason. Keep .duo-fixlog.json valid JSON.
+Do not commit." > "$RUN/fix-$id-r$fixr.log" 2>&1
+    if ! jq -e 'type == "array"' .duo-fixlog.json >/dev/null 2>&1; then echo '[]' > .duo-fixlog.json; fi
+    if ! commit_work "$id" "duo($id): fix round $fixr"; then outcome=stalled; break; fi
+    run_tests "$id"
+    sources="$NEXT_SOURCES"; r=$((r + 1))
+  done
+
+  for f in .duo-review-*.json; do
+    if [[ -f "$f" ]]; then cp "$f" "$RUN/final-$id-${f#.duo-review-}"; fi
+  done
+  cp .duo-fixlog.json "$RUN/fixlog-$id.json"
+  echo "$outcome:$fixr" > "$RUN/fix-$id"
+  if [[ "$outcome" == clean ]]; then setst "$id" done; else setst "$id" blocked; fi
+  mark "$id" end
 }
 
 BAR_W=20
@@ -386,6 +802,7 @@ timeline() { # $1 = times file, $2 = board start, $3 = span → colored bar
       build)  out="$out${CYN}█${RST}" ;;
       test)   out="$out${YLW}█${RST}" ;;
       review) out="$out${MAG}█${RST}" ;;
+      fix)    out="$out${BLU}█${RST}" ;;
       *)      out="$out${DIM}·${RST}" ;;
     esac
   done
@@ -415,7 +832,9 @@ draw_board() { # $1 = frame, $2 = 1 on first draw, $3 = 1 when final
       setup|building) icon="${CYN}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
       testing)        icon="${YLW}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
       reviewing)      icon="${MAG}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
+      fixing)         icon="${BLU}${SPIN[$1 % 10]}${RST}"; running=$((running + 1)) ;;
       done)           icon="${GRN}✓${RST}" ;;
+      blocked)        icon="${RED}●${RST}" ;;
       *)              icon="${RED}✗${RST}" ;;
     esac
     el=""
@@ -429,14 +848,19 @@ draw_board() { # $1 = frame, $2 = 1 on first draw, $3 = 1 when final
   if [[ "$3" == 1 ]]; then
     timing_stats "$RUN"
     if (( n > 1 && T_WALL > 0 && T_EST > T_WALL )); then
+      echo "$n tasks in parallel · wall $(fmt_t "$T_WALL") · serial est. $(fmt_t "$T_EST") · saved ~$(fmt_t $((T_EST - T_WALL))) ($(ratio "$T_EST" "$T_WALL") faster)" > "$RUN/timing"
+    else
+      echo "$n task(s) · wall $(fmt_t "$T_WALL")" > "$RUN/timing"
+    fi
+    if (( n > 1 && T_WALL > 0 && T_EST > T_WALL )); then
       printf '\r%s  %s⇉%s %s tasks · wall %s%s%s · serial est. %s · saved %s~%s%s %s(%s faster)%s\n' "$CLR" "$CYN" "$RST" "$n" \
         "$BOLD" "$(fmt_t "$T_WALL")" "$RST" "$(fmt_t "$T_EST")" "$GRN$BOLD" "$(fmt_t $((T_EST - T_WALL)))" "$RST" "$DIM" "$(ratio "$T_EST" "$T_WALL")" "$RST"
     else
       printf '\r%s  %s→%s %s task(s) · wall %s%s%s\n' "$CLR" "$BLU" "$RST" "$n" "$BOLD" "$(fmt_t "$T_WALL")" "$RST"
     fi
   else
-    printf '\r%s  %swall %s · %s running · %s queued     %s░ setup %s█ build %s█ test %s█ review%s\n' "$CLR" "$DIM" \
-      "$(fmt_t $((now - BOARD_T0)))" "$running" "$queued" "$RST$DIM" "$CYN" "$YLW" "$MAG" "$RST"
+    printf '\r%s  %swall %s · %s running · %s queued     %s░ setup %s█ build %s█ test %s█ review %s█ fix%s\n' "$CLR" "$DIM" \
+      "$(fmt_t $((now - BOARD_T0)))" "$running" "$queued" "$RST$DIM" "$CYN" "$YLW" "$MAG" "$BLU" "$RST"
   fi
 }
 
@@ -454,8 +878,10 @@ implement() {
   fi
 
   SETUP_CMD_R="$(resolve_setup)"; TEST_CMD_R="$(resolve_test)"
+  ALL_SOURCES="code $(enabled_lenses code | tr '\n' ' ')"
+  echo "$ALL_SOURCES" > "$RUN/sources"
   echo
-  note "setup: ${SETUP_CMD_R:-none} · tests: ${TEST_CMD_R:-none} · max parallel: $PARALLEL"
+  note "setup: ${SETUP_CMD_R:-none} · tests: ${TEST_CMD_R:-none} · reviews: $(echo $ALL_SOURCES | tr ' ' ',') · fix rounds: $FIX_ROUNDS · parallel: $PARALLEL"
   while read -r id; do
     wt="$(wt_path "$id")"
     if ! git worktree add -q -b "$(branch "$id")" "$wt" "$BASE" 2>"$RUN/worktree-$id.log"; then
@@ -485,40 +911,163 @@ implement() {
   if (( CANCEL )); then return 130; fi
   if (( TTY )); then draw_board "$i" 0 1; else draw_board 0 1 1; fi
   summary "$RUN"
+  write_report "$RUN"
+  note "report: ${RUN#$ROOT/}/REPORT.md  (/report to open)"
 }
 
 summary() {
-  local run="$1" id f cb cs tr stamp icon
-  stamp="$(basename "$run")"
+  local run="$1" id f src tr icon st outcome fr b sc cells nfix nrej US=$'\x1f'
   echo
   printf '  %sresult%s\n' "$BOLD" "$RST"
   while read -r id; do
-    f="$run/codereview-$id.json"
+    st="$(cat "$run/state-$id" 2>/dev/null)"
     tr=""
     case "$(cat "$run/tests-$id" 2>/dev/null)" in
       pass) tr="${GRN}tests ✓${RST}" ;;
       fail) tr="${RED}tests ✗${RST}" ;;
     esac
-    if jq -e '.issues' "$f" >/dev/null 2>&1; then
-      cb="$(jq '[.issues[] | select(.severity == "blocking")] | length' "$f")"
-      cs="$(jq '[.issues[] | select(.severity == "should")] | length' "$f")"
-      if (( cb > 0 )); then icon="${RED}✗${RST}"; else icon="${GRN}✓${RST}"; fi
-      bar "$icon ${BOLD}$id${RST}  ${DIM}duo/$stamp/$id${RST}  $tr  blocking $cb · should $cs"
-      jq -r '.issues[] | select(.severity != "nit") | "\(.severity)\u001f\(.claim)\u001f\(.evidence)"' "$f" |
-        while IFS=$'\x1f' read -r sev c e; do
-          if [[ "$sev" == blocking ]]; then bar "   ${RED}●${RST} $c ${DIM}$e${RST}"
-          else bar "   ${YLW}○${RST} $c ${DIM}$e${RST}"; fi
-        done
-    else
-      case "$(cat "$run/state-$id" 2>/dev/null)" in
-        "no changes")   bar "${YLW}○${RST} ${BOLD}$id${RST}  agent made no changes ${DIM}— see ${run#$ROOT/}/impl-$id.log${RST}" ;;
-        "setup failed") bar "${RED}✗${RST} ${BOLD}$id${RST}  setup failed ${DIM}— see ${run#$ROOT/}/setup-$id.log${RST}" ;;
-        *)              bar "${YLW}?${RST} ${BOLD}$id${RST}  $tr  no code review ${DIM}— see ${run#$ROOT/}/codereview-$id.log${RST}" ;;
+    case "$st" in
+      done)           icon="${GRN}✓${RST}" ;;
+      blocked)        icon="${RED}●${RST}" ;;
+      "no changes")   bar "${YLW}○${RST} ${BOLD}$id${RST}  agent made no changes ${DIM}— ${run#$ROOT/}/impl-$id.log${RST}"; continue ;;
+      "setup failed") bar "${RED}✗${RST} ${BOLD}$id${RST}  setup failed ${DIM}— ${run#$ROOT/}/setup-$id.log${RST}"; continue ;;
+      *)              bar "${YLW}?${RST} ${BOLD}$id${RST}  ${st:-unknown}"; continue ;;
+    esac
+    bar "$icon ${BOLD}$id${RST}  ${DIM}duo/$(basename "$run")/$id${RST}  $tr"
+
+    cells=""
+    for src in $(cat "$run/sources" 2>/dev/null || echo code); do
+      f="$run/final-$id-$src.json"
+      if ! jq -e '.issues' "$f" >/dev/null 2>&1; then cells="$cells$src ${YLW}?${RST}   "; continue; fi
+      b="$(jq '[.issues[] | select(.severity == "blocking")] | length' "$f")"
+      cells="$cells$src "
+      if [[ "$src" != code ]]; then cells="$cells$(color_score "$(jq -r "$JQ_SCORE score" "$f")") "; fi
+      if (( b > 0 )); then cells="$cells${RED}●$b${RST}   "; else cells="$cells${GRN}✓${RST}   "; fi
+    done
+    bar "   $cells"
+
+    outcome="$(cut -d: -f1 "$run/fix-$id" 2>/dev/null)"; fr="$(cut -d: -f2 "$run/fix-$id" 2>/dev/null)"
+    if [[ -n "$fr" && "$fr" != 0 ]]; then
+      nfix="$(jq '[.[] | select(.decision == "fixed")] | length' "$run/fixlog-$id.json" 2>/dev/null)"
+      nrej="$(jq '[.[] | select(.decision == "rejected")] | length' "$run/fixlog-$id.json" 2>/dev/null)"
+      case "$outcome" in
+        clean)    bar "   ${BLU}↻${RST} $fr fix round(s) · ${nfix:-0} fixed · ${nrej:-0} rejected · all clear" ;;
+        cap)      bar "   ${BLU}↻${RST} $fr fix round(s) · ${nfix:-0} fixed · ${nrej:-0} rejected · ${RED}blockers left${RST} ${DIM}(/fixrounds to allow more)${RST}" ;;
+        deadlock) bar "   ${BLU}↻${RST} $fr fix round(s) · ${YLW}deadlock${RST} on $(cat "$run/dead-$id" 2>/dev/null) — builder rejected, reviewer insists" ;;
+        stalled)  bar "   ${BLU}↻${RST} $fr fix round(s) · ${YLW}the fix changed nothing${RST}" ;;
       esac
+    elif [[ "$outcome" == cap ]]; then
+      bar "   ${RED}blockers left${RST} ${DIM}— auto-fix is off (/fixrounds 1)${RST}"
     fi
+
+    for src in $(cat "$run/sources" 2>/dev/null || echo code); do
+      f="$run/final-$id-$src.json"
+      jq -r --arg s "$src" '.issues[]? | select(.severity != "nit") | "\(.severity)\u001f\($s)\u001f\(.claim)\u001f\(.evidence)"' "$f" 2>/dev/null |
+        while IFS="$US" read -r sev s c e; do
+          if [[ "$sev" == blocking ]]; then bar "   ${RED}●${RST} ${DIM}$s${RST} $c ${DIM}$e${RST}"
+          else bar "   ${YLW}○${RST} ${DIM}$s${RST} $c ${DIM}$e${RST}"; fi
+        done
+    done
   done < "$run/ids"
   echo
-  note "next: /merge to merge these branches into $(git branch --show-current) · /trees · /clean"
+  note "next: /report · /merge into $(git branch --show-current) · /trees · /clean"
+}
+
+md_esc() { sed 's/|/\\|/g'; }
+
+write_report() {
+  local run="$1" out="$1/REPORT.md" id src f st last fr outcome
+  last="$(cat "$run/last_review" 2>/dev/null)"
+  {
+    echo "# duo report"
+    echo
+    echo "> $(cat "$run/task.txt")"
+    echo
+    echo "| | |"
+    echo "|---|---|"
+    echo "| run | \`$(basename "$run")\` |"
+    echo "| plan | $(cut -d: -f1 "$run/loop" 2>/dev/null) after $(cut -d: -f2 "$run/loop" 2>/dev/null) round(s) |"
+    echo "| split | $(cat "$run/split" 2>/dev/null | sed 's/true/parallel/; s/false/serial/') |"
+    echo "| reviews | $(cat "$run/sources" 2>/dev/null | xargs | sed 's/ /, /g') |"
+    if [[ -f "$run/timing" ]]; then echo "| build | $(cat "$run/timing") |"; fi
+    echo
+
+    if [[ -f "$last" ]] && jq -e '(.lenses // []) | length > 0' "$last" >/dev/null 2>&1; then
+      echo "## Plan review"
+      echo
+      echo "| lens | score | open blocking | failed checks |"
+      echo "|---|---|---|---|"
+      jq -r "$JQ_SCORE"' . as $r | .lenses[] | .name as $n
+        | "| \($n) | \(score)/10 | \([$r.issues[] | select(.lens == $n and .severity == "blocking")] | length) | \([.checks[]? | select(.result == "fail") | .item] | join("; ") | gsub("\\|"; "\\\\|")) |"' "$last"
+      echo
+    fi
+
+    if [[ -f "$run/ids" ]]; then
+      echo "## Scorecard"
+      echo
+      printf '| task | tests |'
+      for src in $(cat "$run/sources"); do printf ' %s |' "$src"; done
+      printf ' fixes |\n|---|---|'
+      for src in $(cat "$run/sources"); do printf -- '---|'; done
+      printf -- '---|\n'
+      while read -r id; do
+        st="$(cat "$run/state-$id" 2>/dev/null)"
+        printf '| %s | %s |' "$id" "$(case "$(cat "$run/tests-$id" 2>/dev/null)" in pass) echo ✅;; fail) echo ❌;; *) echo –;; esac)"
+        for src in $(cat "$run/sources"); do
+          f="$run/final-$id-$src.json"
+          if jq -e '.issues' "$f" >/dev/null 2>&1; then
+            printf ' %s |' "$(jq -r "$JQ_SCORE"' ([.issues[] | select(.severity == "blocking")] | length) as $b
+              | (if .checks then "\(score)/10 · " else "" end) + (if $b > 0 then "❌ \($b) blocking" else "✅" end)' "$f")"
+          else
+            printf ' %s |' "${st:-–}"
+          fi
+        done
+        fr="$(cut -d: -f2 "$run/fix-$id" 2>/dev/null)"; outcome="$(cut -d: -f1 "$run/fix-$id" 2>/dev/null)"
+        printf ' %s |\n' "${fr:-0} round(s)${outcome:+, $outcome}"
+      done < "$run/ids"
+      echo
+
+      echo "## Findings"
+      while read -r id; do
+        echo
+        echo "### $id"
+        for src in $(cat "$run/sources"); do
+          f="$run/final-$id-$src.json"
+          jq -e '.issues' "$f" >/dev/null 2>&1 || continue
+          echo
+          echo "**$src**$(jq -r "$JQ_SCORE"' if .checks then " · \(score)/10" else "" end' "$f")"
+          echo
+          jq -r '.issues[] | "- " + (if .severity == "blocking" then "❌" elif .severity == "should" then "⚠️" else "·" end)
+            + " \(.severity) · \(.claim) `\(.evidence)`"' "$f"
+          jq -r '.checks[]? | select(.result == "fail") | "- ☐ failed check: \(.item)" + (if .note then " — \(.note)" else "" end)' "$f"
+          if ! jq -e '(.issues | length) > 0 or ([.checks[]? | select(.result == "fail")] | length) > 0' "$f" >/dev/null; then
+            echo "- ✅ nothing to report"
+          fi
+        done
+        if jq -e 'length > 0' "$run/fixlog-$id.json" >/dev/null 2>&1; then
+          echo
+          echo "**fix log**"
+          echo
+          cat "$run"/review-"$id"-*-r*.json 2>/dev/null | jq -s --slurpfile L "$run/fixlog-$id.json" -r '
+            ([.[].issues[]?] | map({(.id): .claim}) | add // {}) as $c
+            | $L[0][] | "- " + (if .decision == "fixed" then "✅ fixed" else "↩️ rejected" end)
+              + " `\(.id)` \($c[.id] // "") — \(.reason) (round \(.round))"'
+        fi
+      done < "$run/ids"
+      echo
+    fi
+
+    if jq -e 'length > 0' "$run/ledger.json" >/dev/null 2>&1; then
+      echo "## Plan decisions"
+      echo
+      echo "| id | decision | reason |"
+      echo "|---|---|---|"
+      jq -r '.[] | "| \(.id) | \(.decision) | \(.reason | gsub("\\|"; "\\\\|")) |"' "$run/ledger.json"
+      echo
+    fi
+    echo "---"
+    echo "_generated by duo ${VERSION}_"
+  } > "$out"
 }
 
 # ── the main run ────────────────────────────────────────────────────────────
@@ -528,7 +1077,7 @@ run_task() {
   if ! git diff --quiet || ! git diff --cached --quiet; then
     fail "uncommitted changes — commit or stash first"; return 1
   fi
-  REVIEWER="$(other "$IMPL")"
+  resolve_roles
   BASE="$(git rev-parse --abbrev-ref HEAD)"
   STAMP="$(date +%Y%m%d-%H%M%S)"
   RUN="$ROOT/.duo/$STAMP"; REL=".duo/$STAMP"
@@ -541,7 +1090,7 @@ run_task() {
   echo
   printf '  %s%s%s  %s→ %s%s\n\n' "$BOLD" "$task" "$RST" "$DIM" "$BASE" "$RST"
 
-  run_step "plan" codex "$RUN/plan.log" "Task: $task
+  run_step "plan" "$P_AGENT" "$RUN/plan.log" "Task: $task
 
 Investigate the repo and write exactly two files:
 1. $REL/PLAN.md — a concrete implementation plan
@@ -550,17 +1099,18 @@ Investigate the repo and write exactly two files:
 $(split_rule) $NO_CODE"
   if (( CANCEL )); then finish_cancel; return; fi
   if ! jq -e '.tasks | length > 0' "$RUN/plan.json" >/dev/null 2>&1; then
-    step_line "${RED}✗${RST}" "plan" codex "$STEP_T" "no valid plan.json — see $REL/plan.log"
+    step_line "${RED}✗${RST}" "plan" "$P_AGENT" "$STEP_T" "no valid plan.json — see $REL/plan.log"
     echo failed > "$RUN/status"; trap - INT; return 1
   fi
-  step_line "${GRN}✓${RST}" "plan" codex "$STEP_T" \
+  step_line "${GRN}✓${RST}" "plan" "$P_AGENT" "$STEP_T" \
     "$(jq -r '"\(.tasks | length) task(s) · " + (if .parallel then "wants parallel" else "serial" end)' "$RUN/plan.json")"
   echo '[]' > "$RUN/ledger.json"
 
   STATUS=cap
   for ((i = 1; i <= ROUNDS; i++)); do
-    run_step "review r$i" claude "$RUN/review-$i.log" "Round $i. Review $REL/PLAN.md and $REL/plan.json against this repo.
+    run_step "review r$i" "$R_AGENT" "$RUN/review-$i.log" "Round $i. Review $REL/PLAN.md and $REL/plan.json against this repo.
 Original task: $task
+$SOLO_NOTE
 
 Read $REL/ledger.json first: it holds decisions already made on earlier issues.
 Do NOT re-raise a settled issue unless you have NEW evidence. If you do, reuse
@@ -571,8 +1121,9 @@ Check the split: $INDEPENDENCE If parallel=true but these rules are broken, that
 $SEVERITY
 Cite the files you actually checked in evidence.
 
+$(plan_lens_block)
 Write $REL/review-$i.json, valid JSON only:
-{\"issues\":[{\"id\":\"R$i-1\",\"severity\":\"blocking|should|nit\",\"claim\":\"...\",\"evidence\":\"file:line or concrete reason\",\"reraised\":false}]}
+$(plan_review_shape "$i")
 New issues get ids R$i-1, R$i-2, ... An empty issues array is a valid answer.
 $NO_CODE"
     if (( CANCEL )); then finish_cancel; return; fi
@@ -580,17 +1131,17 @@ $NO_CODE"
     LAST="$RUN/review-$i.json"
     echo "$LAST" > "$RUN/last_review"
     if ! jq -e '.issues' "$LAST" >/dev/null 2>&1; then
-      step_line "${RED}✗${RST}" "review r$i" claude "$STEP_T" "no valid review — see $REL/review-$i.log"
+      step_line "${RED}✗${RST}" "review r$i" "$R_AGENT" "$STEP_T" "no valid review — see $REL/review-$i.log"
       echo failed > "$RUN/status"; trap - INT; return 1
     fi
     B="$(jq '[.issues[] | select(.severity == "blocking")] | length' "$LAST")"
     S="$(jq '[.issues[] | select(.severity == "should")] | length' "$LAST")"
     N="$(jq '[.issues[] | select(.severity == "nit")] | length' "$LAST")"
     if (( B == 0 )); then
-      step_line "${GRN}✓${RST}" "review r$i" claude "$STEP_T" "${GRN}0 blocking${RST} · $S should · $N nit"
+      step_line "${GRN}✓${RST}" "review r$i" "$R_AGENT" "$STEP_T" "${GRN}0 blocking${RST} · $S should · $N nit"
       STATUS=converged; break
     fi
-    step_line "${YLW}●${RST}" "review r$i" claude "$STEP_T" "${RED}$B blocking${RST} · $S should · $N nit"
+    step_line "${YLW}●${RST}" "review r$i" "$R_AGENT" "$STEP_T" "${RED}$B blocking${RST} · $S should · $N nit"
 
     DEAD="$(jq -r --slurpfile L "$RUN/ledger.json" '
       [ $L[0][] | select(.decision == "rejected") | .id ] as $rej
@@ -600,7 +1151,7 @@ $NO_CODE"
     if (( i == ROUNDS )); then STATUS=cap; break; fi
 
     cp "$RUN/PLAN.md" "$RUN/PLAN.prev.md"; cp "$RUN/plan.json" "$RUN/plan.prev.json"
-    run_step "revise r$i" codex "$RUN/revise-$i.log" "Read $REL/review-$i.json and $REL/ledger.json.
+    run_step "revise r$i" "$P_AGENT" "$RUN/revise-$i.log" "Read $REL/review-$i.json and $REL/ledger.json.
 Update $REL/PLAN.md and $REL/plan.json (same JSON shape, must stay valid).
 Address every blocking and should issue; nits are optional. $(split_rule)
 
@@ -612,12 +1163,12 @@ $NO_CODE"
     if (( CANCEL )); then finish_cancel; return; fi
     if ! jq -e 'type == "array"' "$RUN/ledger.json" >/dev/null 2>&1 ||
        ! jq -e '.tasks | length > 0' "$RUN/plan.json" >/dev/null 2>&1; then
-      step_line "${RED}✗${RST}" "revise r$i" codex "$STEP_T" "broke plan.json or ledger.json — see $REL/revise-$i.log"
+      step_line "${RED}✗${RST}" "revise r$i" "$P_AGENT" "$STEP_T" "broke plan.json or ledger.json — see $REL/revise-$i.log"
       echo failed > "$RUN/status"; trap - INT; return 1
     fi
     CHANGED="$(diff "$RUN/PLAN.prev.md" "$RUN/PLAN.md" | grep -c '^[<>]')"
     if ! cmp -s "$RUN/plan.prev.json" "$RUN/plan.json"; then CHANGED=$((CHANGED + MIN_CHANGE)); fi
-    step_line "${GRN}✓${RST}" "revise r$i" codex "$STEP_T" \
+    step_line "${GRN}✓${RST}" "revise r$i" "$P_AGENT" "$STEP_T" \
       "$CHANGED lines changed · $(jq '[.[] | select(.decision == "accepted")] | length' "$RUN/ledger.json") accepted · $(jq '[.[] | select(.decision == "rejected")] | length' "$RUN/ledger.json") rejected"
     if (( CHANGED < MIN_CHANGE )); then STATUS=stalled; break; fi
   done
@@ -651,8 +1202,11 @@ help() {
   ${BOLD}run${RST}
     <any text>              plan → review loop → gate → build → cross-review
   ${BOLD}settings${RST}  ${DIM}(apply now; /save keeps them for this repo)${RST}
+    /settings               menu: lenses, split, parallel, fix rounds
     /config                 show current settings
-    /impl claude|codex      who builds (the other reviews)
+    /planner claude|codex   who plans (the other reviews the plan)
+    /impl claude|codex      who builds (the other reviews the code)
+    /flip                   swap both roles
     /rounds N               max plan/review rounds            ${DIM}1–10${RST}
     /minchange N            fewer changed lines = stalled     ${DIM}0–500${RST}
     /split auto|prefer|off  how eager the planner is to split
@@ -661,11 +1215,14 @@ help() {
     /test auto|none|<cmd>   test step before code review
     /env on|off             copy .env* files into worktrees
     /planonly on|off        stop after the plan loop
+    /lenses [a,b|off]       specialist reviewers (no argument: menu)
+    /fixrounds N            auto-fix rounds for blocking findings  ${DIM}0–3${RST}
     /save · /save global    persist for this repo · for all repos
     /reset                  back to built-in defaults
   ${BOLD}runs${RST}
     /runs                   recent runs
     /show [run]             plan + results of a run            ${DIM}default: latest${RST}
+    /report [run]           scorecard + findings report          ${DIM}default: latest${RST}
     /merge [run]            merge a run's branches into current branch, then test
     /trees                  list duo worktrees
     /clean [all]            remove duo worktrees + branches   ${DIM}all: also run logs${RST}
@@ -677,7 +1234,10 @@ show_config() {
   local s t
   s="$(resolve_setup)"; t="$(resolve_test)"
   echo
-  cfg_row "builds"      "$IMPL"        "reviews: $(other "$IMPL") · /impl"
+  resolve_roles
+  cfg_row "planner"     "$P_AGENT"     "plan reviewed by $R_AGENT · /planner"
+  cfg_row "builder"     "$B_AGENT"     "code reviewed by $REVIEWER · /impl"
+  if (( SOLO )); then cfg_row "mode" "solo" "only $P_AGENT installed · duo doctor"; fi
   cfg_row "rounds"      "$ROUNDS"      "/rounds"
   cfg_row "min change"  "$MIN_CHANGE"  "/minchange"
   cfg_row "split"       "$SPLIT"       "/split auto|prefer|off"
@@ -686,6 +1246,8 @@ show_config() {
   cfg_row "test"        "$TEST"        "→ ${t:-nothing} · /test"
   cfg_row "copy .env"   "$ENV_COPY"    "/env"
   cfg_row "plan only"   "$PLAN_ONLY"   "/planonly"
+  cfg_row "lenses"      "${LENSES:-none}" "plan: $(enabled_lenses plan | xargs | tr ' ' ',') · code: $(enabled_lenses code | xargs | tr ' ' ',') · /lenses"
+  cfg_row "fix rounds"  "$FIX_ROUNDS"  "/fixrounds"
   bar
   if [[ -f "$REPO_CFG" ]]; then bar "${DIM}repo defaults   ${REPO_CFG#$ROOT/}${RST}"; else bar "${DIM}repo defaults   none yet (/save)${RST}"; fi
   if [[ -f "$GLOBAL_CFG" ]]; then bar "${DIM}global defaults $GLOBAL_CFG${RST}"; fi
@@ -701,12 +1263,28 @@ set_num() { # key name value lo hi
     fail "usage: /$2 <$4–$5>"
   fi
 }
+set_agent() { # key name value
+  if [[ "$3" != claude && "$3" != codex ]]; then fail "usage: /$2 claude|codex"; return; fi
+  if ! have_agent "$3"; then fail "$3 isn't installed — run duo doctor"; return; fi
+  printf -v "$1" '%s' "$3"
+  resolve_roles
+  ok "$P_AGENT plans · $R_AGENT reviews · $B_AGENT builds · $REVIEWER reviews code"
+}
+
 set_enum() { # key name value options...
   local k="$1" n="$2" v="$3" o; shift 3
   for o in "$@"; do
     if [[ "$v" == "$o" ]]; then printf -v "$k" '%s' "$v"; ok "$n → $v"; return; fi
   done
   fail "usage: /$n $(echo "$@" | tr ' ' '|')"
+}
+
+open_report() {
+  local run; run="$(resolve_run "$1")"
+  if [[ -z "$run" || ! -f "$run/loop" ]]; then fail "no such run (see /runs)"; return; fi
+  write_report "$run"
+  ${PAGER:-less -R} "$run/REPORT.md"
+  note "${run#$ROOT/}/REPORT.md"
 }
 
 resolve_run() { # resolve_run [stamp] → echoes run dir
@@ -754,6 +1332,9 @@ merge_run() {
   if ! git diff --quiet || ! git diff --cached --quiet; then fail "uncommitted changes — commit or stash first"; return; fi
   stamp="$(basename "$run")"
   summary "$run"
+  if grep -qx blocked "$run"/state-* 2>/dev/null; then
+    warn "some branches still have blocking findings — see /report before merging"
+  fi
   printf '  %s›%s merge these into %s%s%s? %s[y/N]%s ' "$MAG" "$RST" "$BOLD" "$(git branch --show-current)" "$RST" "$DIM" "$RST"
   read -rsn1 key; echo
   if [[ "$key" != y && "$key" != Y ]]; then note "not merged"; return; fi
@@ -803,13 +1384,21 @@ slash() { # returns 1 to quit
   case "$cmd" in
     /help|/h|/\?)   help ;;
     /config|/c)     show_config ;;
-    /impl)          set_enum IMPL impl "$arg" claude codex ;;
+    /impl|/builder) set_agent IMPL builder "$arg" ;;
+    /planner)       set_agent PLANNER planner "$arg" ;;
+    /flip)          if [[ "$PLANNER" == codex ]]; then PLANNER=claude; else PLANNER=codex; fi
+                    if [[ "$IMPL" == codex ]]; then IMPL=claude; else IMPL=codex; fi
+                    resolve_roles; ok "$P_AGENT plans · $R_AGENT reviews · $B_AGENT builds · $REVIEWER reviews code" ;;
     /rounds)        set_num ROUNDS rounds "$arg" 1 10 ;;
     /minchange)     set_num MIN_CHANGE minchange "$arg" 0 500 ;;
     /parallel)      set_num PARALLEL parallel "$arg" 1 8 ;;
     /split)         set_enum SPLIT split "$arg" auto prefer off ;;
     /env)           set_enum ENV_COPY env "$arg" on off ;;
     /planonly)      set_enum PLAN_ONLY planonly "$arg" on off ;;
+    /settings|/s)   lens_picker && note "applies now · /save keeps it for this repo · /save global for all repos" ;;
+    /lenses)        if [[ -z "$arg" ]]; then lens_picker && note "applies now · /save to keep it for this repo"; else set_lenses "$arg"; fi ;;
+    /fixrounds)     set_num FIX_ROUNDS fixrounds "$arg" 0 3 ;;
+    /report)        open_report "$arg" ;;
     /setup)         if [[ -n "$arg" ]]; then SETUP="$arg"; ok "setup → $SETUP ($(resolve_setup || true))"; else fail "usage: /setup auto|none|<cmd>"; fi ;;
     /test)          if [[ -n "$arg" ]]; then TEST="$arg"; ok "test → $TEST ($(resolve_test || true))"; else fail "usage: /test auto|none|<cmd>"; fi ;;
     /save)          if [[ "$arg" == global ]]; then save_cfg "$GLOBAL_CFG"; ok "saved as global defaults"
@@ -842,8 +1431,10 @@ TIPS=(
   "good tasks say what done looks like: the behaviour, the files, the edge cases"
   "/planonly on — see the plan without building anything"
   "/split prefer — nudge the planner towards parallel tasks"
-  "/impl codex — let codex build and claude review the code"
+  "/flip — swap who plans and who builds"
   "/rounds 2 — cap the plan/review loop"
+  "/settings — lenses, split mode, parallel and fix rounds in one menu"
+  "/report — scorecard and findings for the last run"
   "↑ recalls earlier tasks · /runs shows past runs"
   "tasks that each create their own files split best; a shared translation file forces serial"
 )
@@ -866,6 +1457,7 @@ hint() {
 repl() {
   local line rc PROMPT HIST="$CFG_DIR/history" LAST_WAS_SLASH=0
   banner
+  onboard
   mkdir -p "$CFG_DIR"; touch "$HIST"
   set -o history; history -r "$HIST" 2>/dev/null
   PROMPT=$'\001'"$BOLD$MAG"$'\002''duo'$'\001'"$RST$DIM"$'\002'' › '$'\001'"$RST"$'\002'
@@ -922,36 +1514,52 @@ self_update() {
       fi ;;
   esac
 }
-
 doctor() {
-  local bad=0 t v
+  local bad=0 t v a n=0 st
   echo
   printf '  %sduo %s%s  %s%s%s\n\n' "$BOLD" "$VERSION" "$RST" "$DIM" "$(script_path)" "$RST"
-  for t in git jq claude codex; do
-    if command -v "$t" >/dev/null 2>&1; then
-      ok "$t  ${DIM}$(command -v "$t")${RST}"
+  for t in git jq; do
+    if command -v "$t" >/dev/null 2>&1; then ok "$t  ${DIM}$(command -v "$t")${RST}"
     else
       bad=1
       case "$t" in
-        jq)     fail "jq missing — brew install jq" ;;
-        git)    fail "git missing — xcode-select --install" ;;
-        claude) if [[ -x "$HOME/.claude/local/claude" ]]; then
-                  fail "claude is only a shell alias, which scripts can't see — fix:"
-                  note "  mkdir -p ~/.local/bin && ln -sf ~/.claude/local/claude ~/.local/bin/claude"
-                else
-                  fail "claude missing — npm install -g @anthropic-ai/claude-code, then run claude once to log in"
-                fi ;;
-        codex)  fail "codex missing — npm install -g @openai/codex, then codex login" ;;
+        jq)  fail "jq missing — brew install jq" ;;
+        git) fail "git missing — xcode-select --install" ;;
       esac
     fi
   done
-  if command -v codex >/dev/null 2>&1; then
-    if codex exec --help 2>/dev/null | grep -q -- '--sandbox'; then ok "codex supports --sandbox"
-    else bad=1; fail "codex is too old (no --sandbox) — npm install -g @openai/codex@latest"; fi
-  fi
-  if command -v claude >/dev/null 2>&1; then
-    if claude --help 2>/dev/null | grep -q -- '--permission-mode'; then ok "claude supports --permission-mode"
-    else bad=1; fail "claude is too old — update Claude Code"; fi
+  echo
+  for a in codex claude; do
+    if have_agent "$a"; then
+      n=$((n + 1))
+      st="$(login_state "$a")"
+      case "$st" in
+        yes)     ok "$a  ${DIM}$(command -v "$a") · logged in${RST}" ;;
+        no)      warn "$a  installed but not logged in — run: $( [[ $a == codex ]] && echo 'codex login' || echo 'claude  (and log in)')" ;;
+        unknown) ok "$a  ${DIM}$(command -v "$a") · login status unknown (this version can't report it)${RST}" ;;
+      esac
+      if [[ "$a" == codex ]] && ! codex exec --help 2>/dev/null | grep -q -- '--sandbox'; then
+        bad=1; fail "codex is too old (no --sandbox) — npm install -g @openai/codex@latest"
+      fi
+      if [[ "$a" == claude ]] && ! claude --help 2>/dev/null | grep -q -- '--permission-mode'; then
+        bad=1; fail "claude is too old — npm install -g @anthropic-ai/claude-code@latest"
+      fi
+    elif [[ "$a" == claude && -x "$HOME/.claude/local/claude" ]]; then
+      fail "claude is only a shell alias, which scripts can't see — fix:"
+      note "  mkdir -p ~/.local/bin && ln -sf ~/.claude/local/claude ~/.local/bin/claude"
+    else
+      warn "$a not installed — $( [[ $a == codex ]] && echo 'npm install -g @openai/codex, then codex login' || echo 'npm install -g @anthropic-ai/claude-code, then run claude to log in')"
+    fi
+  done
+  echo
+  case "$n" in
+    0) bad=1; fail "no agents — duo needs claude, codex, or both" ;;
+    1) warn "solo mode — one agent does everything; install the other for cross-model review" ;;
+    2) ok "cross-model mode — both agents available" ;;
+  esac
+  if [[ -n "$ROOT" ]]; then
+    resolve_roles
+    note "roles: $P_AGENT plans · $R_AGENT reviews plans · $B_AGENT builds · $REVIEWER reviews code"
   fi
   v="$(git rev-parse --show-toplevel 2>/dev/null)"
   if [[ -n "$v" ]]; then ok "in git repo ${DIM}$v${RST}"; else note "not in a git repo (cd into one to run duo)"; fi
@@ -965,12 +1573,17 @@ main() {
   local t
   case "${1:-}" in
     --update|update) self_update; exit $? ;;
-    doctor|--doctor) doctor; exit $? ;;
+    doctor|--doctor)
+      set_defaults; load_cfg "$GLOBAL_CFG"
+      ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+      if [[ -n "$ROOT" ]]; then load_cfg "$ROOT/.duo/config"; fi
+      env_overrides; doctor; exit $? ;;
     -v|--version) echo "duo $VERSION"; exit 0 ;;
   esac
-  for t in git jq claude codex; do
+  for t in git jq; do
     if ! command -v "$t" >/dev/null 2>&1; then fail "$t not found — run: duo doctor"; exit 1; fi
   done
+  if [[ -z "$(available_agents)" ]]; then fail "neither claude nor codex is installed — run: duo doctor"; exit 1; fi
   ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { fail "not inside a git repo"; exit 1; }
   REPO="$(basename "$ROOT")"
   REPO_CFG="$ROOT/.duo/config"

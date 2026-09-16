@@ -1,14 +1,14 @@
 <div align="center">
 
 ```
-┌┬┐┬ ┬┌─┐
- │││ ││ │
-─┴┘└─┘└─┘
+█▀▄ █ █ █▀█
+█ █ █ █ █ █
+▀▀  ▀▀▀ ▀▀▀
 ```
 
 **Two models. One plan. Zero merge conflicts.**
 
-Codex plans · Claude reviews · git worktrees build · the other model reviews the diff
+Codex plans · Claude reviews · git worktrees build · specialist lenses score it · blockers get fixed
 
 [![npm](https://img.shields.io/npm/v/@electricmonkey/duo?color=cb3837&label=npm)](https://www.npmjs.com/package/@electricmonkey/duo)
 ![bash](https://img.shields.io/badge/bash-3.2%2B-4EAA25)
@@ -58,6 +58,7 @@ duo › add e2e smoke tests for login, dashboard and capture
 - [The convergence loop, formally](#the-convergence-loop-formally)
 - [Parallelism, or: when is a task embarrassingly parallel?](#parallelism-or-when-is-a-task-embarrassingly-parallel)
 - [Time accounting](#time-accounting)
+- [Lenses](#lenses)
 - [Install](#install)
 - [Usage](#usage)
 - [Configuration](#configuration)
@@ -107,18 +108,34 @@ stateDiagram-v2
     CrossReview --> [*]: summary
 ```
 
-The roles are fixed during planning and swappable during building:
+The roles are configurable. Defaults shown; `/planner`, `/impl` and `/flip` change them:
 
 | phase | agent | may write to | runs in |
 |---|---|---|---|
-| plan | codex | `.duo/<run>/` only | your checkout |
-| review | claude | `.duo/<run>/` only | your checkout |
-| revise | codex | `.duo/<run>/` only | your checkout |
+| plan | `PLANNER` (default codex) | `.duo/<run>/` only | your checkout |
+| review | the other agent | `.duo/<run>/` only | your checkout |
+| revise | `PLANNER` | `.duo/<run>/` only | your checkout |
 | build | `IMPL` (default claude) | source files | `../<repo>-wt-<run>-<task>` |
 | test | duo itself (plain `bash -c`) | whatever your tests write | the worktree |
-| code review | the *other* agent | `.duo-review.json` only | the worktree |
+| code review + lenses | the *other* agent | `.duo-review-<src>.json` only | the worktree |
+| fix | `IMPL` | source files, `.duo-fixlog.json` | the worktree |
 
 Agents never commit. duo stages, commits, diffs and merges; the agents only ever produce files.
+
+### Roles and solo mode
+
+duo detects which agents are installed (`command -v`) and resolves roles at the start of every run:
+
+```
+planner  = PLANNER if installed, else the other agent
+reviewer = the other agent if installed, else the planner      (plans)
+builder  = IMPL if installed, else the other agent
+reviewer = the other agent if installed, else the builder      (code)
+```
+
+With only one agent installed, duo runs in **solo mode**: the same model plans, reviews and builds, every review runs in a fresh context, and review prompts add an explicit "you did not write this, be skeptical" instruction. It works, but you lose the point of cross-model review, and the banner says so.
+
+`duo doctor` reports each agent as installed, logged in, or login-unknown. Codex is asked via `codex login status`. Claude is asked via `claude auth status` only if the installed version advertises an `auth` subcommand, so doctor never accidentally opens an interactive session. Every probe runs with a time limit and closed stdin.
 
 ---
 
@@ -212,7 +229,117 @@ With no history, it prints the theoretical ceiling $n / \lceil n / P' \rceil$ an
 The timeline column maps wall time onto 20 cells. Cell $k$ samples the phase active at $t_0 + \frac{(2k+1)\,\text{span}}{40}$:
 
 ```
-░ setup   █ build   █ test   █ review   · idle
+░ setup   █ build   █ test   █ review   █ fix   · idle
+```
+
+---
+
+## Lenses
+
+The normal review asks "is this correct?". Lenses ask "is this correct *for a security officer / a designer / the person who owns the product*?".
+
+A lens is a markdown file with YAML-ish frontmatter and a checklist:
+
+```markdown
+---
+name: security
+title: Security officer
+phase: code                 # plan | code | both
+summary: exploitable flaws, authz, secrets, injection
+blocking: an exploitable vulnerability or leaked secret, with a concrete exploit path
+---
+You think like an attacker who has just read this diff.
+
+## Checklist
+- Every new or changed endpoint checks authentication
+- Authorization is enforced server-side for the specific resource (no IDOR)
+- ...
+```
+
+Built-in lenses:
+
+| lens | phase | blocking means |
+|---|---|---|
+| `product` | plan | the plan builds the wrong thing, or scope grows well beyond the task |
+| `ux` | plan + code | a user can get stuck, lose data, or can't use it with a keyboard or screen reader |
+| `security` | code | an exploitable flaw with a concrete exploit path and `file:line` evidence |
+
+### Where lenses run
+
+```
+plan ──► review ◄── plan lenses folded into the same review call
+            │        (one agent run, issues tagged with "lens")
+            ▼
+gate ──► build ──► test ──► ┌ code review ┐
+                            ├ lens: security ├──► blockers? ──► fix ──► test ──► re-review (only sources with blockers)
+                            └ lens: ux ────┘         │
+                                                     └── none ──► done
+```
+
+Plan lenses share the plan reviewer's call, so they cost tokens, not extra round-trips. Code lenses each get their own agent run on the *non-building* model, concurrently inside each worktree.
+
+### Scores are derived, not vibed
+
+Language models are terrible at calibrated numbers; ask for a score out of ten and you get 7. So duo never asks for one. Each lens evaluates every checklist item as `pass`, `fail` or `n/a`, and duo computes
+
+$$\text{score} = 10 \cdot \frac{\lvert \text{pass} \rvert}{\lvert \text{pass} \rvert + \lvert \text{fail} \rvert}$$
+
+rounded to one decimal, with `n/a` excluded. A lens with nothing applicable scores `–`. The score is informational; only `blocking` findings drive behaviour.
+
+### The fix loop
+
+Blocking findings from any source (general code review or a lens) are merged into `.duo-blockers.json` with a `source` tag. Then, up to `FIX_ROUNDS` times:
+
+1. the **builder** fixes only those findings and writes a decision per finding (`fixed` or `rejected` + reason) to `.duo-fixlog.json`,
+2. duo commits the fix as its own commit (`duo(<task>): fix round n`),
+3. tests run again,
+4. only the sources that had blockers review again, with the fix log in hand.
+
+It stops at the first of:
+
+| outcome | condition |
+|---|---|
+| ✓ clean | no blocking findings left |
+| ● cap | `FIX_ROUNDS` used up, blockers remain |
+| ● deadlock | a re-raised finding was rejected by the builder |
+| ● stalled | the fix produced no diff |
+
+It's the plan loop's convergence logic, reapplied to code. Same ledger discipline, same deadlock rule, same "hand it to a human" exit.
+
+### Selecting lenses
+
+On first launch, duo opens a settings menu (↑↓ move, space toggle, ←→ change, enter save) for lenses, split mode, parallel and fix rounds, and saves the result as your global default. Afterwards:
+
+```
+duo › /settings                # the same menu
+duo › /lenses                  # the same menu
+duo › /lenses security,ux      # direct
+duo › /lenses off
+duo › /fixrounds 2             # 0 disables auto-fix
+duo › /save                    # keep it for this repo
+```
+
+### Custom lenses
+
+Drop a file in either place; later wins on name clashes:
+
+| location | scope |
+|---|---|
+| `<package>/lenses/` | built-in |
+| `~/.config/duo/lenses/` | you |
+| `<repo>/duo-lenses/` | your team (commit it) |
+
+Good lenses have 6–10 checklist items that a reviewer can answer from a diff, and a `blocking` definition narrow enough that it rarely fires.
+
+### Reports
+
+Every build writes `REPORT.md` into the run directory: plan-lens scores, a scorecard per task and source, findings with evidence, failed checks, the fix log, and the plan's decision ledger. `/report` regenerates and opens it.
+
+```markdown
+| task    | tests | code | security       | ux          | fixes            |
+|---------|-------|------|----------------|-------------|------------------|
+| login   | ✅    | ✅   | 9/10 · ✅      | 7.5/10 · ✅ | 1 round(s), clean |
+| capture | ✅    | ✅   | 6/10 · ❌ 1 blocking | 10/10 · ✅ | 1 round(s), cap |
 ```
 
 ---
@@ -232,8 +359,7 @@ Requirements:
 | bash | 3.2 | yes, the 2007 one Apple still ships |
 | git | 2.5+ | `git worktree` |
 | jq | 1.6+ | `IN()` in the deadlock query |
-| `claude` | a version with `--permission-mode` | Claude Code, logged in |
-| `codex` | a version with `exec --sandbox` | Codex CLI, logged in |
+| `claude` and/or `codex` | Claude Code with `--permission-mode`, Codex CLI with `exec --sandbox` | at least one, logged in; both for cross-model review |
 
 duo has no API keys of its own. It shells out to the two CLIs and uses whatever subscription or key they're logged in with.
 
@@ -267,8 +393,11 @@ Slash commands:
 
 | command | effect |
 |---|---|
+| `/settings` | arrow-key menu: lenses, planner, builder, split mode, parallel, fix rounds |
 | `/config` | show effective settings and where they came from |
+| `/planner claude\|codex` | who plans; the other reviews the plan |
 | `/impl claude\|codex` | who builds; the other reviews the code |
+| `/flip` | swap both roles |
 | `/rounds N` | max plan/review rounds (1–10) |
 | `/minchange N` | stall threshold in changed lines (0–500) |
 | `/split auto\|prefer\|off` | planner's appetite for parallelism |
@@ -277,6 +406,9 @@ Slash commands:
 | `/test auto\|none\|<cmd>` | test step before code review |
 | `/env on\|off` | copy `.env*` into worktrees |
 | `/planonly on\|off` | stop after the plan loop |
+| `/lenses [a,b\|off]` | specialist reviewers; no argument opens the picker |
+| `/fixrounds N` | auto-fix rounds for blocking findings (0–3) |
+| `/report [run]` | regenerate and open `REPORT.md` |
 | `/save` · `/save global` | persist for this repo · for all repos |
 | `/reset` | built-in defaults (not persisted) |
 | `/runs` | recent runs |
@@ -304,6 +436,7 @@ built-in defaults
 
 | key | default | env |
 |---|---|---|
+| `PLANNER` | `codex` | `DUO_PLANNER` |
 | `IMPL` | `claude` | `DUO_IMPL` |
 | `ROUNDS` | `3` | `DUO_ROUNDS` |
 | `MIN_CHANGE` | `5` | `DUO_MIN_CHANGE` |
@@ -313,6 +446,8 @@ built-in defaults
 | `TEST` | `auto` | `DUO_TEST` |
 | `ENV_COPY` | `on` | `DUO_ENV_COPY` |
 | `PLAN_ONLY` | `off` | `DUO_PLAN_ONLY` |
+| `LENSES` | *(none)* | `DUO_LENSES` |
+| `FIX_ROUNDS` | `1` | `DUO_FIX_ROUNDS` |
 
 Config files are parsed as `KEY=value` lines against an allowlist. They are never `source`d, so a config file can't execute code.
 
@@ -353,16 +488,22 @@ Everything lives under `.duo/`, which duo adds to `.git/info/exclude` (local, ne
     ├── last_review · dead        pointers for the gate
     ├── split · dupes             final split decision and overlapping files
     ├── ids · task-<id>.md        the task list handed to workers
-    ├── state-<id>                queued → setup → building → testing → reviewing → done
+    ├── state-<id>                queued → setup → building → testing → reviewing
+    │                             ⇄ fixing → done | blocked
     ├── times-<id>                phase timestamps
     ├── tests-<id>                pass | fail
-    ├── codereview-<id>.json      cross-review of the diff
+    ├── sources                   code + enabled code lenses
+    ├── review-<id>-<src>-r<n>.json   every review round, per source
+    ├── final-<id>-<src>.json     last review per source
+    ├── fixlog-<id>.json          builder's fixed/rejected decisions
+    ├── fix-<id>                  <outcome>:<rounds>
+    ├── REPORT.md                 the human-readable result
     ├── merged-test.log           tests after /merge
     └── *.log                     raw agent output (plan, review-i, revise-i,
                                   setup-, impl-, test-, codereview-, worktree-)
 ```
 
-Inside each worktree, duo drops `.duo-plan.md`, `.duo-task.md`, `.duo-diff.patch`, `.duo-test.log` and `.duo-review.json`. They match the `.duo*` exclude pattern, so they never end up in a commit.
+Inside each worktree, duo drops `.duo-plan.md`, `.duo-task.md`, `.duo-diff.patch`, `.duo-test.log`, `.duo-review-<src>.json`, `.duo-blockers.json` and `.duo-fixlog.json`. They match the `.duo*` exclude pattern, so they never end up in a commit.
 
 ---
 
@@ -386,23 +527,27 @@ Inside each worktree, duo drops `.duo-plan.md`, `.duo-task.md`, `.duo-diff.patch
 }
 ```
 
-`review-<i>.json` and `codereview-<id>.json`:
+Plan review `review-<i>.json` (the `lens` tag and `lenses` array appear when plan lenses are on), code review `.duo-review-code.json`, and lens reviews `.duo-review-<lens>.json` (with `checks`):
 
 ```json
 {
   "issues": [
     {
       "id": "R2-1",
+      "lens": "general",
       "severity": "blocking | should | nit",
       "claim": "what is wrong",
       "evidence": "file:line or a concrete reason",
       "reraised": false
     }
+  ],
+  "checks": [
+    { "item": "Every new endpoint checks authentication", "result": "pass | fail | n/a", "note": "…" }
   ]
 }
 ```
 
-`ledger.json`:
+`ledger.json` (plan) and `fixlog-<id>.json` (code) share a shape:
 
 ```json
 [
@@ -491,8 +636,17 @@ For end-to-end tests without burning tokens, put stub `claude` and `codex` scrip
 
 ## FAQ
 
-**Why is Codex the planner and Claude the reviewer?**
-Because a fixed assignment makes the ledger and the logs easier to reason about. The builder is configurable with `/impl`, and the code reviewer is always the other model.
+**Won't lenses make everything slower?**
+Plan lenses ride along in the existing review call. Code lenses add one agent run each per task, concurrently. With lenses off (the default until you pick some), nothing changes.
+
+**How is this different from gstack's personas?**
+gstack is an opinionated skill pack for your agent. duo's lenses are plugged into an engine: cross-model review, derived scores, a fix loop with a decision log, and worktree isolation. Different layer, compatible idea.
+
+**Why is Codex the default planner and Claude the default reviewer?**
+No deep reason; it's a default. `/flip` swaps it, and the reviewer is always the other model when both are installed.
+
+**I only have one of the two. Can I still use duo?**
+Yes, in solo mode. You keep the loop, the ledger, worktrees, lenses and reports, but lose the cross-model disagreement that makes reviews sharp.
 
 **Why not just ask one model to review itself?**
 Same-model review shares the same blind spots. Cross-model disagreement is the signal duo is built to surface.

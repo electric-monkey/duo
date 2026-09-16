@@ -1,12 +1,13 @@
 {
   "name": "@electricmonkey/duo",
-  "version": "2.2.1",
-  "description": "Codex plans, Claude reviews, git worktrees build — a converging plan/review loop for coding agents",
+  "version": "2.4.0",
+  "description": "Two coding agents, one plan: Codex and Claude plan, review and build in git worktrees \u2014 roles flippable, solo mode if you only have one",
   "bin": {
     "duo": "bin/duo"
   },
   "files": [
     "bin",
+    "lenses",
     "README.md",
     "LICENSE"
   ],
@@ -15,13 +16,15 @@
     "linux"
   ],
   "keywords": [
-    "claude-code",
-    "codex",
-    "ai",
     "agents",
+    "ai",
+    "claude-code",
+    "cli",
     "code-review",
+    "codex",
     "git-worktree",
-    "cli"
+    "security-review",
+    "ux-review"
   ],
   "license": "MIT",
   "repository": {
