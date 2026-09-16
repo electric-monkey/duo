@@ -1,0 +1,860 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+#  duo — codex plans · claude reviews · worktrees implement · cross-review
+#
+#    duo               interactive session (type a task, or /help)
+#    duo "task"        one-shot run with your saved settings
+#    duo /config       run a single slash command
+#    duo update        get the latest version
+#    duo doctor        check dependencies
+#
+#  Settings: built-in defaults → ~/.config/duo/config → <repo>/.duo/config
+#            → env vars (DUO_IMPL, DUO_ROUNDS, DUO_PARALLEL, DUO_SETUP, ...)
+#  Requires: git, jq, claude, codex.  Works with macOS bash 3.2.
+# ─────────────────────────────────────────────────────────────────────────────
+set -o pipefail
+VERSION="2.1.0"
+PKG="@eletricmonkey/duo"
+
+# ── settings ────────────────────────────────────────────────────────────────
+KEYS="IMPL ROUNDS MIN_CHANGE PARALLEL SPLIT SETUP TEST ENV_COPY PLAN_ONLY"
+ENV_IMPL="${IMPL:-}"; ENV_MAX_ROUNDS="${MAX_ROUNDS:-}"
+ENV_SETUP_CMD="${SETUP_CMD:-}"; ENV_MAX_PARALLEL="${MAX_PARALLEL:-}"
+
+set_defaults() {
+  IMPL=claude; ROUNDS=3; MIN_CHANGE=5; PARALLEL=3; SPLIT=auto
+  SETUP=auto; TEST=auto; ENV_COPY=on; PLAN_ONLY=off
+}
+
+CFG_DIR="$HOME/.config/duo"
+GLOBAL_CFG="$CFG_DIR/config"
+
+load_cfg() {
+  local f="$1" k v
+  [[ -f "$f" ]] || return 0
+  while IFS='=' read -r k v || [[ -n "$k" ]]; do
+    case " $KEYS " in *" $k "*) printf -v "$k" '%s' "$v" ;; esac
+  done < "$f"
+}
+
+save_cfg() {
+  local k
+  mkdir -p "$(dirname "$1")"
+  { echo "# duo settings — edit here or use slash commands"
+    for k in $KEYS; do printf '%s=%s\n' "$k" "${!k}"; done; } > "$1"
+}
+
+env_overrides() {
+  local k e
+  if [[ -n "$ENV_IMPL" ]]; then IMPL="$ENV_IMPL"; fi
+  if [[ -n "$ENV_MAX_ROUNDS" ]]; then ROUNDS="$ENV_MAX_ROUNDS"; fi
+  if [[ -n "$ENV_SETUP_CMD" ]]; then SETUP="$ENV_SETUP_CMD"; fi
+  if [[ -n "$ENV_MAX_PARALLEL" ]]; then PARALLEL="$ENV_MAX_PARALLEL"; fi
+  for k in $KEYS; do
+    e="DUO_$k"
+    if [[ -n "${!e:-}" ]]; then printf -v "$k" '%s' "${!e}"; fi
+  done
+}
+
+# ── look & feel ─────────────────────────────────────────────────────────────
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  TTY=1; ESC=$'\033'
+  RST="$ESC[0m"; BOLD="$ESC[1m"; DIM="$ESC[2m"; CLR="$ESC[K"
+  RED="$ESC[31m"; GRN="$ESC[32m"; YLW="$ESC[33m"; BLU="$ESC[34m"; MAG="$ESC[35m"; CYN="$ESC[36m"
+else
+  TTY=0; ESC=""; RST=""; BOLD=""; DIM=""; CLR=""
+  RED=""; GRN=""; YLW=""; BLU=""; MAG=""; CYN=""
+fi
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+ok()   { printf '  %s✓%s %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '  %s!%s %s\n' "$YLW" "$RST" "$*"; }
+fail() { printf '  %s✗%s %s\n' "$RED" "$RST" "$*"; }
+note() { printf '  %s%s%s\n' "$DIM" "$*" "$RST"; }
+bar()  { printf '  %s┃%s %s\n' "$MAG" "$RST" "$*"; }
+cols() { local c; c="$(tput cols 2>/dev/null)"; echo "${c:-80}"; }
+fmt_t(){ printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
+other(){ if [[ "$1" == claude ]]; then echo codex; else echo claude; fi; }
+
+step_line() { # icon label who seconds detail
+  printf '  %s %-13s %s%-7s %7s%s  %s\n' "$1" "$2" "$DIM" "$3" "$(fmt_t "$4")" "$RST" "$5"
+}
+
+banner() {
+  printf '\n  %s%s◆ duo%s %sv%s · codex plans · claude reviews · worktrees build%s\n' \
+    "$BOLD" "$MAG" "$RST" "$DIM" "$VERSION" "$RST"
+  printf '  %srepo%s %s   %sbranch%s %s   %simpl%s %s   %srounds%s %s   %ssplit%s %s\n' \
+    "$DIM" "$RST" "$REPO" "$DIM" "$RST" "$(git branch --show-current)" \
+    "$DIM" "$RST" "$IMPL" "$DIM" "$RST" "$ROUNDS" "$DIM" "$RST" "$SPLIT"
+  printf '  %stype a task to start · /help for commands · ctrl-d to quit%s\n\n' "$DIM" "$RST"
+}
+
+# ── environment detection ───────────────────────────────────────────────────
+pkg_manager() {
+  if   [[ -f "$ROOT/bun.lock" || -f "$ROOT/bun.lockb" ]]; then echo bun
+  elif [[ -f "$ROOT/pnpm-lock.yaml" ]]; then echo pnpm
+  elif [[ -f "$ROOT/yarn.lock" ]]; then echo yarn
+  elif [[ -f "$ROOT/package-lock.json" ]]; then echo npm
+  fi
+}
+
+resolve_setup() {
+  case "$SETUP" in
+    none) echo "" ;;
+    auto)
+      case "$(pkg_manager)" in
+        bun)  echo "bun install --frozen-lockfile" ;;
+        pnpm) echo "pnpm install --frozen-lockfile" ;;
+        yarn) echo "yarn install --frozen-lockfile" ;;
+        npm)  echo "npm ci" ;;
+        *)    if [[ -f "$ROOT/pubspec.yaml" ]]; then echo "flutter pub get"; fi ;;
+      esac ;;
+    *) echo "$SETUP" ;;
+  esac
+}
+
+resolve_test() {
+  case "$TEST" in
+    none) echo "" ;;
+    auto)
+      local pm; pm="$(pkg_manager)"
+      if [[ -n "$pm" ]] && jq -e '.scripts.test' "$ROOT/package.json" >/dev/null 2>&1; then
+        echo "$pm run test"
+      fi ;;
+    *) echo "$TEST" ;;
+  esac
+}
+
+# ── agents ──────────────────────────────────────────────────────────────────
+agent() { # agent <claude|codex> <prompt>  (cwd = where it runs)
+  if [[ "$1" == claude ]]; then
+    claude -p --verbose --output-format stream-json --permission-mode acceptEdits "$2" </dev/null
+  else
+    codex exec -s workspace-write "$2" </dev/null
+  fi
+}
+
+activity() { # last visible action from an agent log
+  local who="$1" log="$2"
+  if [[ "$who" == claude ]]; then
+    tail -n 40 "$log" 2>/dev/null | jq -Rr 'fromjson? | select(.type == "assistant")
+      | .message.content[]? | select(.type == "tool_use")
+      | "\(.name) \(.input.file_path // .input.pattern // .input.command // .input.path // "")"' 2>/dev/null \
+      | tail -1 | tr '\n\t' '  ' | sed "s|$ROOT/||g"
+  else
+    grep -v '^[[:space:]]*$' "$log" 2>/dev/null | tail -1 | tr '\t\r' '  ' | sed "s|$ROOT/||g"
+  fi
+}
+
+CANCEL=0
+kill_tree() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
+  kill -TERM "$1" 2>/dev/null
+}
+on_int() {
+  CANCEL=1
+  local p
+  for p in $(jobs -p); do kill_tree "$p"; done
+}
+
+run_step() { # run_step <label> <who> <log> <prompt>; sets STEP_T
+  local label="$1" who="$2" log="$3" prompt="$4" t0=$SECONDS i=0 act="" pid rc w
+  agent "$who" "$prompt" > "$log" 2>&1 &
+  pid=$!
+  w=$(( $(cols) - 36 )); if (( w < 10 )); then w=10; fi
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( TTY )); then
+      if (( i % 15 == 0 )); then act="$(activity "$who" "$log")"; fi
+      printf '\r%s  %s%s%s %-13s %s%-7s %7s%s  %s%s%s' "$CLR" "$CYN" "${SPIN[i % 10]}" "$RST" \
+        "$label" "$DIM" "$who" "$(fmt_t $((SECONDS - t0)))" "$RST" "$DIM" "${act:0:w}" "$RST"
+    fi
+    i=$((i + 1)); sleep 0.12
+  done
+  wait "$pid"; rc=$?
+  if (( TTY )); then printf '\r%s' "$CLR"; fi
+  STEP_T=$((SECONDS - t0))
+  if (( CANCEL )); then return 130; fi
+  return $rc
+}
+
+# ── prompts ─────────────────────────────────────────────────────────────────
+NO_CODE="Do NOT modify any source code in this step."
+PLAN_SCHEMA='{"summary":"string","parallel":true,"reason":"string","tasks":[{"id":"kebab-case","title":"string","instructions":"string","files":["path"]}]}'
+SEVERITY='Severity: blocking = the plan/code would produce a wrong or broken result; should = real but non-fatal; nit = style or preference. Be strict: most things are NOT blocking.'
+INDEPENDENCE='Tasks are independent only if they touch disjoint files, share no changed interfaces/types/config/migrations/lockfiles/translation files/test fixtures, have no ordering dependency, and can each be tested on their own.'
+
+split_rule() {
+  case "$SPLIT" in
+    off)    echo "Always set parallel=false with exactly one task." ;;
+    prefer) echo "Prefer splitting into 2-4 parallel tasks when possible. $INDEPENDENCE If those rules cannot be met, set parallel=false with exactly one task." ;;
+    *)      echo "Set parallel=true only when it clearly helps. $INDEPENDENCE Otherwise set parallel=false with exactly one task. Most tasks should NOT be parallel." ;;
+  esac
+}
+
+# ── plan card (used by the gate and /show) ──────────────────────────────────
+plan_card() {
+  local run="$1" st rounds last par US=$'\x1f'
+  st="$(cut -d: -f1 "$run/loop" 2>/dev/null)"
+  rounds="$(cut -d: -f2 "$run/loop" 2>/dev/null)"
+  last="$(cat "$run/last_review" 2>/dev/null)"
+  par="$(cat "$run/split" 2>/dev/null)"
+  echo
+  bar "${BOLD}$(jq -r '.summary' "$run/plan.json")${RST}"
+  bar
+  case "$st" in
+    converged) bar "${GRN}✓ converged${RST} after $rounds round(s) — no blocking issues" ;;
+    stalled)   bar "${YLW}! stalled${RST} after $rounds round(s) — revisions were cosmetic" ;;
+    deadlock)  bar "${YLW}! deadlock${RST} — planner rejected, reviewer insists: $(cat "$run/dead" 2>/dev/null)" ;;
+    cap)       bar "${RED}✗ round cap${RST} hit after $rounds round(s) with blockers left" ;;
+  esac
+  if [[ "$st" != converged && -f "$last" ]]; then
+    jq -r '.issues[] | select(.severity == "blocking") | "\(.id)\u001f\(.claim)"' "$last" |
+      while IFS="$US" read -r id c; do bar "  ${RED}●${RST} $id ${DIM}$c${RST}"; done
+  fi
+  if [[ "$par" == true ]]; then
+    bar "${CYN}⇉ parallel${RST} ${DIM}$(jq -r '.reason' "$run/plan.json")${RST}"
+  else
+    bar "${BLU}→ serial${RST}   ${DIM}$(jq -r '.reason' "$run/plan.json")${RST}"
+  fi
+  if [[ -s "$run/dupes" ]]; then
+    bar "${YLW}! planner wanted parallel, but tasks share:${RST} $(tr '\n' ' ' < "$run/dupes")"
+  fi
+  bar
+  jq -r '.tasks | to_entries[] | "\(.key + 1)\u001f\(.value.id)\u001f\(.value.title)\u001f\(.value.files | join(", "))"' "$run/plan.json" |
+    while IFS="$US" read -r n id t f; do
+      bar "${BOLD}$n.${RST} $t ${DIM}· $id${RST}"
+      bar "   ${DIM}$f${RST}"
+    done
+  bar
+  bar "${DIM}${run#$ROOT/}/PLAN.md${RST}"
+}
+
+split_check() { # decides final serial/parallel for $RUN
+  local par n
+  par="$(jq -r '.parallel' "$RUN/plan.json")"
+  n="$(jq '.tasks | length' "$RUN/plan.json")"
+  jq -r '.tasks[].files[]' "$RUN/plan.json" | sort | uniq -d > "$RUN/dupes"
+  if [[ "$SPLIT" == off || "$par" != true || "$n" -lt 2 ]]; then
+    : > "$RUN/dupes"; par=false
+  elif [[ -s "$RUN/dupes" ]]; then
+    par=false
+  fi
+  echo "$par" > "$RUN/split"
+}
+
+gate() {
+  local key
+  while :; do
+    plan_card "$RUN"
+    if [[ "$PLAN_ONLY" == on ]]; then note "plan-only mode — stopping here (/planonly off to build)"; return 1; fi
+    printf '\n  %s›%s build with %s%s%s, review by %s? %s[y]es · [p]lan · [e]dit · [n]o%s ' \
+      "$MAG" "$RST" "$BOLD" "$IMPL" "$RST" "$(other "$IMPL")" "$DIM" "$RST"
+    read -rsn1 key; echo
+    case "$key" in
+      y|Y) return 0 ;;
+      p|P) ${PAGER:-less -R} "$RUN/PLAN.md" ;;
+      e|E) ${EDITOR:-nano} "$RUN/PLAN.md" "$RUN/plan.json"
+           if jq -e '.tasks | length > 0' "$RUN/plan.json" >/dev/null 2>&1; then
+             split_check; ok "plan updated"
+           else
+             fail "plan.json is no longer valid JSON — fix it (e) or stop (n)"
+           fi ;;
+      *) note "stopped · plan kept in ${RUN#$ROOT/}"; return 1 ;;
+    esac
+  done
+}
+
+# ── implementation board ────────────────────────────────────────────────────
+wt_path() { echo "$(dirname "$ROOT")/$REPO-wt-$STAMP-$1"; }
+branch()  { echo "duo/$STAMP/$1"; }
+setst()   { echo "$2" > "$RUN/state-$1"; }
+
+work() {
+  local id="$1" wt f copied="" rc
+  wt="$(wt_path "$id")"
+  cd "$wt" || { setst "$id" failed; return; }
+  date +%s > "$RUN/t0-$id"
+  if [[ "$ENV_COPY" == on ]]; then
+    for f in "$ROOT"/.env*; do
+      if [[ -f "$f" ]]; then cp "$f" . && copied="$copied $(basename "$f")"; fi
+    done
+  fi
+  if [[ -n "$SETUP_CMD_R" ]]; then
+    setst "$id" setup
+    bash -c "$SETUP_CMD_R" > "$RUN/setup-$id.log" 2>&1 || { setst "$id" "setup failed"; date +%s > "$RUN/t1-$id"; return; }
+  fi
+
+  setst "$id" building
+  agent "$IMPL" "Read .duo-plan.md for context. Implement ONLY the task in
+.duo-task.md. Touch only the files that task needs. Do not commit." > "$RUN/impl-$id.log" 2>&1
+
+  git add -A
+  if [[ -n "$copied" ]]; then git reset -q -- $copied 2>/dev/null; fi
+  if ! git commit -qm "duo($id): $(head -1 .duo-task.md | sed 's/^# //')" >/dev/null 2>&1; then
+    setst "$id" "no changes"; date +%s > "$RUN/t1-$id"; return
+  fi
+  git diff "$BASE...HEAD" > .duo-diff.patch
+
+  local tnote="No test command was run."
+  if [[ -n "$TEST_CMD_R" ]]; then
+    setst "$id" testing
+    bash -c "$TEST_CMD_R" > .duo-test.log 2>&1; rc=$?
+    cp .duo-test.log "$RUN/test-$id.log"
+    if (( rc == 0 )); then echo pass > "$RUN/tests-$id"; tnote="Tests ($TEST_CMD_R) PASSED."
+    else echo fail > "$RUN/tests-$id"; tnote="Tests ($TEST_CMD_R) FAILED — see .duo-test.log."; fi
+  fi
+
+  setst "$id" reviewing
+  agent "$REVIEWER" "Review the diff in .duo-diff.patch against the task in
+.duo-task.md and the plan in .duo-plan.md. $tnote
+$SEVERITY
+Write .duo-review.json, valid JSON only:
+{\"issues\":[{\"id\":\"C-1\",\"severity\":\"blocking|should|nit\",\"claim\":\"...\",\"evidence\":\"file:line\"}]}
+$NO_CODE" > "$RUN/codereview-$id.log" 2>&1
+  cp .duo-review.json "$RUN/codereview-$id.json" 2>/dev/null
+  setst "$id" done
+  date +%s > "$RUN/t1-$id"
+}
+
+draw_board() { # $1 = frame index, $2 = 1 on first draw
+  local id st icon t0 t1 el now n
+  n="$(wc -l < "$RUN/ids" | tr -d ' ')"
+  if [[ "$2" != 1 ]]; then printf '%s[%sA' "$ESC" "$n"; fi
+  now="$(date +%s)"
+  while read -r id; do
+    st="$(cat "$RUN/state-$id" 2>/dev/null || echo queued)"
+    case "$st" in
+      queued)                icon="${DIM}·${RST}" ;;
+      setup|building)        icon="${CYN}${SPIN[$1 % 10]}${RST}" ;;
+      testing)               icon="${YLW}${SPIN[$1 % 10]}${RST}" ;;
+      reviewing)             icon="${MAG}${SPIN[$1 % 10]}${RST}" ;;
+      done)                  icon="${GRN}✓${RST}" ;;
+      *)                     icon="${RED}✗${RST}" ;;
+    esac
+    el=""
+    if [[ -f "$RUN/t0-$id" ]]; then
+      t0="$(cat "$RUN/t0-$id")"; t1="$(cat "$RUN/t1-$id" 2>/dev/null || echo "$now")"
+      el="$(fmt_t $((t1 - t0)))"
+    fi
+    printf '\r%s  %s %-34s %s%-12s %7s%s\n' "$CLR" "$icon" "${id:0:34}" "$DIM" "$st" "$el" "$RST"
+  done < "$RUN/ids"
+}
+
+implement() {
+  local id wt i=0 next=0 ids=() running
+  if [[ "$(cat "$RUN/split")" == true ]]; then
+    jq -r '.tasks[].id' "$RUN/plan.json" > "$RUN/ids"
+    while read -r id; do
+      jq -r --arg id "$id" '.tasks[] | select(.id == $id) |
+        "# \(.title)\n\n\(.instructions)\n\nFiles: \(.files | join(", "))"' "$RUN/plan.json" > "$RUN/task-$id.md"
+    done < "$RUN/ids"
+  else
+    echo all > "$RUN/ids"
+    printf '# Full plan\n\nImplement the complete plan in .duo-plan.md.\n' > "$RUN/task-all.md"
+  fi
+
+  SETUP_CMD_R="$(resolve_setup)"; TEST_CMD_R="$(resolve_test)"
+  echo
+  note "setup: ${SETUP_CMD_R:-none} · tests: ${TEST_CMD_R:-none} · max parallel: $PARALLEL"
+  while read -r id; do
+    wt="$(wt_path "$id")"
+    if ! git worktree add -q -b "$(branch "$id")" "$wt" "$BASE" 2>"$RUN/worktree-$id.log"; then
+      fail "could not create worktree for $id — see ${RUN#$ROOT/}/worktree-$id.log"; return 1
+    fi
+    cp "$RUN/PLAN.md" "$wt/.duo-plan.md"
+    cp "$RUN/task-$id.md" "$wt/.duo-task.md"
+    ids+=("$id")
+  done < "$RUN/ids"
+  echo
+
+  if (( TTY )); then draw_board 0 1; fi
+  while :; do
+    if (( CANCEL )); then break; fi
+    running="$(jobs -rp | wc -l | tr -d ' ')"
+    while (( next < ${#ids[@]} && running < PARALLEL )); do
+      work "${ids[next]}" &
+      next=$((next + 1)); running=$((running + 1))
+    done
+    sleep 0.15; i=$((i + 1))
+    if (( TTY )); then draw_board "$i" 0; fi
+    if (( next >= ${#ids[@]} )) && [[ -z "$(jobs -rp)" ]]; then break; fi
+  done
+  wait 2>/dev/null
+  if (( ! TTY )); then draw_board 0 1; fi
+  if (( CANCEL )); then return 130; fi
+  summary "$RUN"
+}
+
+summary() {
+  local run="$1" id f cb cs tr stamp icon
+  stamp="$(basename "$run")"
+  echo
+  printf '  %sresult%s\n' "$BOLD" "$RST"
+  while read -r id; do
+    f="$run/codereview-$id.json"
+    tr=""
+    case "$(cat "$run/tests-$id" 2>/dev/null)" in
+      pass) tr="${GRN}tests ✓${RST}" ;;
+      fail) tr="${RED}tests ✗${RST}" ;;
+    esac
+    if jq -e '.issues' "$f" >/dev/null 2>&1; then
+      cb="$(jq '[.issues[] | select(.severity == "blocking")] | length' "$f")"
+      cs="$(jq '[.issues[] | select(.severity == "should")] | length' "$f")"
+      if (( cb > 0 )); then icon="${RED}✗${RST}"; else icon="${GRN}✓${RST}"; fi
+      bar "$icon ${BOLD}$id${RST}  ${DIM}duo/$stamp/$id${RST}  $tr  blocking $cb · should $cs"
+      jq -r '.issues[] | select(.severity != "nit") | "\(.severity)\u001f\(.claim)\u001f\(.evidence)"' "$f" |
+        while IFS=$'\x1f' read -r sev c e; do
+          if [[ "$sev" == blocking ]]; then bar "   ${RED}●${RST} $c ${DIM}$e${RST}"
+          else bar "   ${YLW}○${RST} $c ${DIM}$e${RST}"; fi
+        done
+    else
+      case "$(cat "$run/state-$id" 2>/dev/null)" in
+        "no changes")   bar "${YLW}○${RST} ${BOLD}$id${RST}  agent made no changes ${DIM}— see ${run#$ROOT/}/impl-$id.log${RST}" ;;
+        "setup failed") bar "${RED}✗${RST} ${BOLD}$id${RST}  setup failed ${DIM}— see ${run#$ROOT/}/setup-$id.log${RST}" ;;
+        *)              bar "${YLW}?${RST} ${BOLD}$id${RST}  $tr  no code review ${DIM}— see ${run#$ROOT/}/codereview-$id.log${RST}" ;;
+      esac
+    fi
+  done < "$run/ids"
+  echo
+  note "next: /merge to merge these branches into $(git branch --show-current) · /trees · /clean"
+}
+
+# ── the main run ────────────────────────────────────────────────────────────
+run_task() {
+  local task="$1" i B S N CHANGED DEAD LAST STATUS
+  cd "$ROOT" || return 1
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    fail "uncommitted changes — commit or stash first"; return 1
+  fi
+  REVIEWER="$(other "$IMPL")"
+  BASE="$(git rev-parse --abbrev-ref HEAD)"
+  STAMP="$(date +%Y%m%d-%H%M%S)"
+  RUN="$ROOT/.duo/$STAMP"; REL=".duo/$STAMP"
+  mkdir -p "$RUN"
+  echo "$task" > "$RUN/task.txt"
+  echo "planning" > "$RUN/status"
+  CANCEL=0
+  trap on_int INT
+
+  echo
+  printf '  %s%s%s  %s→ %s%s\n\n' "$BOLD" "$task" "$RST" "$DIM" "$BASE" "$RST"
+
+  run_step "plan" codex "$RUN/plan.log" "Task: $task
+
+Investigate the repo and write exactly two files:
+1. $REL/PLAN.md — a concrete implementation plan
+2. $REL/plan.json — valid JSON only, shape: $PLAN_SCHEMA
+
+$(split_rule) $NO_CODE"
+  if (( CANCEL )); then finish_cancel; return; fi
+  if ! jq -e '.tasks | length > 0' "$RUN/plan.json" >/dev/null 2>&1; then
+    step_line "${RED}✗${RST}" "plan" codex "$STEP_T" "no valid plan.json — see $REL/plan.log"
+    echo failed > "$RUN/status"; trap - INT; return 1
+  fi
+  step_line "${GRN}✓${RST}" "plan" codex "$STEP_T" \
+    "$(jq -r '"\(.tasks | length) task(s) · " + (if .parallel then "wants parallel" else "serial" end)' "$RUN/plan.json")"
+  echo '[]' > "$RUN/ledger.json"
+
+  STATUS=cap
+  for ((i = 1; i <= ROUNDS; i++)); do
+    run_step "review r$i" claude "$RUN/review-$i.log" "Round $i. Review $REL/PLAN.md and $REL/plan.json against this repo.
+Original task: $task
+
+Read $REL/ledger.json first: it holds decisions already made on earlier issues.
+Do NOT re-raise a settled issue unless you have NEW evidence. If you do, reuse
+its id and set reraised=true.
+
+Check the split: $INDEPENDENCE If parallel=true but these rules are broken, that is a blocking issue.
+
+$SEVERITY
+Cite the files you actually checked in evidence.
+
+Write $REL/review-$i.json, valid JSON only:
+{\"issues\":[{\"id\":\"R$i-1\",\"severity\":\"blocking|should|nit\",\"claim\":\"...\",\"evidence\":\"file:line or concrete reason\",\"reraised\":false}]}
+New issues get ids R$i-1, R$i-2, ... An empty issues array is a valid answer.
+$NO_CODE"
+    if (( CANCEL )); then finish_cancel; return; fi
+
+    LAST="$RUN/review-$i.json"
+    echo "$LAST" > "$RUN/last_review"
+    if ! jq -e '.issues' "$LAST" >/dev/null 2>&1; then
+      step_line "${RED}✗${RST}" "review r$i" claude "$STEP_T" "no valid review — see $REL/review-$i.log"
+      echo failed > "$RUN/status"; trap - INT; return 1
+    fi
+    B="$(jq '[.issues[] | select(.severity == "blocking")] | length' "$LAST")"
+    S="$(jq '[.issues[] | select(.severity == "should")] | length' "$LAST")"
+    N="$(jq '[.issues[] | select(.severity == "nit")] | length' "$LAST")"
+    if (( B == 0 )); then
+      step_line "${GRN}✓${RST}" "review r$i" claude "$STEP_T" "${GRN}0 blocking${RST} · $S should · $N nit"
+      STATUS=converged; break
+    fi
+    step_line "${YLW}●${RST}" "review r$i" claude "$STEP_T" "${RED}$B blocking${RST} · $S should · $N nit"
+
+    DEAD="$(jq -r --slurpfile L "$RUN/ledger.json" '
+      [ $L[0][] | select(.decision == "rejected") | .id ] as $rej
+      | [ .issues[] | select(.severity == "blocking" and .reraised == true) | .id
+          | select(IN($rej[])) ] | join(" ")' "$LAST")"
+    if [[ -n "$DEAD" ]]; then echo "$DEAD" > "$RUN/dead"; STATUS=deadlock; break; fi
+    if (( i == ROUNDS )); then STATUS=cap; break; fi
+
+    cp "$RUN/PLAN.md" "$RUN/PLAN.prev.md"; cp "$RUN/plan.json" "$RUN/plan.prev.json"
+    run_step "revise r$i" codex "$RUN/revise-$i.log" "Read $REL/review-$i.json and $REL/ledger.json.
+Update $REL/PLAN.md and $REL/plan.json (same JSON shape, must stay valid).
+Address every blocking and should issue; nits are optional. $(split_rule)
+
+For EACH issue in review-$i.json append one entry to the JSON array in
+$REL/ledger.json:
+{\"id\":\"<issue id>\",\"decision\":\"accepted|rejected|deferred\",\"reason\":\"one line\",\"round\":$i}
+Reject only with a concrete, checkable reason. Keep ledger.json valid JSON.
+$NO_CODE"
+    if (( CANCEL )); then finish_cancel; return; fi
+    if ! jq -e 'type == "array"' "$RUN/ledger.json" >/dev/null 2>&1 ||
+       ! jq -e '.tasks | length > 0' "$RUN/plan.json" >/dev/null 2>&1; then
+      step_line "${RED}✗${RST}" "revise r$i" codex "$STEP_T" "broke plan.json or ledger.json — see $REL/revise-$i.log"
+      echo failed > "$RUN/status"; trap - INT; return 1
+    fi
+    CHANGED="$(diff "$RUN/PLAN.prev.md" "$RUN/PLAN.md" | grep -c '^[<>]')"
+    if ! cmp -s "$RUN/plan.prev.json" "$RUN/plan.json"; then CHANGED=$((CHANGED + MIN_CHANGE)); fi
+    step_line "${GRN}✓${RST}" "revise r$i" codex "$STEP_T" \
+      "$CHANGED lines changed · $(jq '[.[] | select(.decision == "accepted")] | length' "$RUN/ledger.json") accepted · $(jq '[.[] | select(.decision == "rejected")] | length' "$RUN/ledger.json") rejected"
+    if (( CHANGED < MIN_CHANGE )); then STATUS=stalled; break; fi
+  done
+
+  echo "$STATUS:$i" > "$RUN/loop"
+  echo "$STATUS" > "$RUN/status"
+  split_check
+
+  trap - INT
+  if ! gate; then return 0; fi
+  trap on_int INT
+  echo building > "$RUN/status"
+  implement; local rc=$?
+  trap - INT
+  if (( rc == 130 )); then finish_cancel; return; fi
+  echo built > "$RUN/status"
+}
+
+finish_cancel() {
+  trap - INT
+  printf '\r%s' "$CLR"; echo
+  warn "cancelled · partial output kept in ${RUN#$ROOT/} · /trees and /clean to tidy worktrees"
+  echo cancelled > "$RUN/status"
+  CANCEL=0
+}
+
+# ── slash commands ──────────────────────────────────────────────────────────
+help() {
+  cat <<H
+
+  ${BOLD}run${RST}
+    <any text>              plan → review loop → gate → build → cross-review
+  ${BOLD}settings${RST}  ${DIM}(apply now; /save keeps them for this repo)${RST}
+    /config                 show current settings
+    /impl claude|codex      who builds (the other reviews)
+    /rounds N               max plan/review rounds            ${DIM}1–10${RST}
+    /minchange N            fewer changed lines = stalled     ${DIM}0–500${RST}
+    /split auto|prefer|off  how eager the planner is to split
+    /parallel N             max worktrees building at once    ${DIM}1–8${RST}
+    /setup auto|none|<cmd>  install step in each worktree
+    /test auto|none|<cmd>   test step before code review
+    /env on|off             copy .env* files into worktrees
+    /planonly on|off        stop after the plan loop
+    /save · /save global    persist for this repo · for all repos
+    /reset                  back to built-in defaults
+  ${BOLD}runs${RST}
+    /runs                   recent runs
+    /show [run]             plan + results of a run            ${DIM}default: latest${RST}
+    /merge [run]            merge a run's branches into current branch, then test
+    /trees                  list duo worktrees
+    /clean [all]            remove duo worktrees + branches   ${DIM}all: also run logs${RST}
+    /doctor · /update · /clear · /quit
+H
+}
+
+show_config() {
+  local s t
+  s="$(resolve_setup)"; t="$(resolve_test)"
+  echo
+  cfg_row "builds"      "$IMPL"        "reviews: $(other "$IMPL") · /impl"
+  cfg_row "rounds"      "$ROUNDS"      "/rounds"
+  cfg_row "min change"  "$MIN_CHANGE"  "/minchange"
+  cfg_row "split"       "$SPLIT"       "/split auto|prefer|off"
+  cfg_row "parallel"    "$PARALLEL"    "/parallel"
+  cfg_row "setup"       "$SETUP"       "→ ${s:-nothing} · /setup"
+  cfg_row "test"        "$TEST"        "→ ${t:-nothing} · /test"
+  cfg_row "copy .env"   "$ENV_COPY"    "/env"
+  cfg_row "plan only"   "$PLAN_ONLY"   "/planonly"
+  bar
+  if [[ -f "$REPO_CFG" ]]; then bar "${DIM}repo defaults   ${REPO_CFG#$ROOT/}${RST}"; else bar "${DIM}repo defaults   none yet (/save)${RST}"; fi
+  if [[ -f "$GLOBAL_CFG" ]]; then bar "${DIM}global defaults $GLOBAL_CFG${RST}"; fi
+  echo
+}
+cfg_row() { printf '  %s┃%s %-11s %s%-8s%s %s%s%s\n' "$MAG" "$RST" "$1" "$BOLD" "$2" "$RST" "$DIM" "$3" "$RST"; }
+
+set_num() { # key name value lo hi
+  local re='^[0-9]+$'
+  if [[ "$3" =~ $re ]] && (( $3 >= $4 && $3 <= $5 )); then
+    printf -v "$1" '%s' "$3"; ok "$2 → $3"
+  else
+    fail "usage: /$2 <$4–$5>"
+  fi
+}
+set_enum() { # key name value options...
+  local k="$1" n="$2" v="$3" o; shift 3
+  for o in "$@"; do
+    if [[ "$v" == "$o" ]]; then printf -v "$k" '%s' "$v"; ok "$n → $v"; return; fi
+  done
+  fail "usage: /$n $(echo "$@" | tr ' ' '|')"
+}
+
+resolve_run() { # resolve_run [stamp] → echoes run dir
+  if [[ -n "$1" ]]; then
+    if [[ -d "$ROOT/.duo/$1" ]]; then echo "$ROOT/.duo/$1"; fi
+  else
+    ls -1dt "$ROOT"/.duo/2*/ 2>/dev/null | head -1 | sed 's|/$||'
+  fi
+}
+
+list_runs() {
+  local d
+  echo
+  ls -1dt "$ROOT"/.duo/2*/ 2>/dev/null | head -12 | while read -r d; do
+    d="${d%/}"
+    printf '  %s┃%s %s%s%s  %-10s %s\n' "$MAG" "$RST" "$DIM" "$(basename "$d")" "$RST" \
+      "$(cat "$d/status" 2>/dev/null || echo '?')" "$(head -c 70 "$d/task.txt" 2>/dev/null)"
+  done
+  echo
+}
+
+show_run() {
+  local run; run="$(resolve_run "$1")"
+  if [[ -z "$run" || ! -f "$run/plan.json" ]]; then fail "no such run (see /runs)"; return; fi
+  printf '\n  %s%s%s  %s%s · %s%s\n' "$BOLD" "$(cat "$run/task.txt")" "$RST" "$DIM" "$(basename "$run")" "$(cat "$run/status")" "$RST"
+  if [[ -f "$run/loop" ]]; then plan_card "$run"; fi
+  if [[ -f "$run/ids" ]]; then summary "$run"; fi
+}
+
+list_trees() {
+  echo
+  local found=0 line
+  while read -r line; do
+    found=1; bar "$line"
+  done < <(git worktree list | grep -F "/$REPO-wt-")
+  if (( found == 0 )); then note "no duo worktrees"; fi
+  echo
+}
+
+merge_run() {
+  local run id br stamp n=0 key rc t
+  run="$(resolve_run "$1")"
+  if [[ -z "$run" || ! -f "$run/ids" ]]; then fail "that run has no built branches (see /runs)"; return; fi
+  cd "$ROOT" || return
+  if ! git diff --quiet || ! git diff --cached --quiet; then fail "uncommitted changes — commit or stash first"; return; fi
+  stamp="$(basename "$run")"
+  summary "$run"
+  printf '  %s›%s merge these into %s%s%s? %s[y/N]%s ' "$MAG" "$RST" "$BOLD" "$(git branch --show-current)" "$RST" "$DIM" "$RST"
+  read -rsn1 key; echo
+  if [[ "$key" != y && "$key" != Y ]]; then note "not merged"; return; fi
+  while read -r id; do
+    br="duo/$stamp/$id"
+    if ! git rev-parse --verify -q "$br" >/dev/null; then warn "$id: branch missing, skipped"; continue; fi
+    if git merge --no-ff -q -m "duo: merge $id" "$br" >/dev/null 2>&1; then
+      ok "merged $id"; n=$((n + 1))
+    else
+      git merge --abort 2>/dev/null
+      fail "conflict merging $id — stopped. Resolve by hand: git merge $br"; return
+    fi
+  done < "$run/ids"
+  t="$(resolve_test)"
+  if [[ -n "$t" && $n -gt 0 ]]; then
+    printf '  %s…%s running %s on the merged result\n' "$CYN" "$RST" "$t"
+    bash -c "$t" > "$run/merged-test.log" 2>&1; rc=$?
+    if (( rc == 0 )); then ok "tests pass after merge"; else fail "tests fail after merge — see ${run#$ROOT/}/merged-test.log"; fi
+  fi
+}
+
+clean_all() {
+  local paths brs np nb key p b
+  cd "$ROOT" || return
+  paths="$(git worktree list --porcelain | awk '/^worktree /{print substr($0, 10)}' | grep -F "/$REPO-wt-")"
+  brs="$(git for-each-ref --format='%(refname:short)' refs/heads/duo/)"
+  np="$(printf '%s' "$paths" | grep -c . )"; nb="$(printf '%s' "$brs" | grep -c . )"
+  if [[ "$np" == 0 && "$nb" == 0 && "$1" != all ]]; then note "nothing to clean"; return; fi
+  warn "removes $np worktree(s) and $nb duo branch(es) — unmerged work is lost$( [[ "$1" == all ]] && echo ', plus all run logs')"
+  printf '  %s›%s continue? %s[y/N]%s ' "$MAG" "$RST" "$DIM" "$RST"
+  read -rsn1 key; echo
+  if [[ "$key" != y && "$key" != Y ]]; then note "kept everything"; return; fi
+  if [[ -n "$paths" ]]; then
+    while read -r p; do git worktree remove --force "$p" 2>/dev/null && ok "removed $(basename "$p")"; done <<< "$paths"
+  fi
+  git worktree prune
+  if [[ -n "$brs" ]]; then
+    while read -r b; do git branch -D -q "$b" 2>/dev/null; done <<< "$brs"
+    ok "deleted $nb branch(es)"
+  fi
+  if [[ "$1" == all ]]; then rm -rf "$ROOT"/.duo/2*; ok "deleted run logs"; fi
+}
+
+slash() { # returns 1 to quit
+  local cmd="${1%% *}" arg=""
+  if [[ "$1" == *" "* ]]; then arg="${1#* }"; fi
+  case "$cmd" in
+    /help|/h|/\?)   help ;;
+    /config|/c)     show_config ;;
+    /impl)          set_enum IMPL impl "$arg" claude codex ;;
+    /rounds)        set_num ROUNDS rounds "$arg" 1 10 ;;
+    /minchange)     set_num MIN_CHANGE minchange "$arg" 0 500 ;;
+    /parallel)      set_num PARALLEL parallel "$arg" 1 8 ;;
+    /split)         set_enum SPLIT split "$arg" auto prefer off ;;
+    /env)           set_enum ENV_COPY env "$arg" on off ;;
+    /planonly)      set_enum PLAN_ONLY planonly "$arg" on off ;;
+    /setup)         if [[ -n "$arg" ]]; then SETUP="$arg"; ok "setup → $SETUP ($(resolve_setup || true))"; else fail "usage: /setup auto|none|<cmd>"; fi ;;
+    /test)          if [[ -n "$arg" ]]; then TEST="$arg"; ok "test → $TEST ($(resolve_test || true))"; else fail "usage: /test auto|none|<cmd>"; fi ;;
+    /save)          if [[ "$arg" == global ]]; then save_cfg "$GLOBAL_CFG"; ok "saved as global defaults"
+                    else save_cfg "$REPO_CFG"; ok "saved as defaults for $REPO"; fi ;;
+    /reset)         set_defaults; ok "back to built-in defaults (not saved)" ;;
+    /runs)          list_runs ;;
+    /show)          show_run "$arg" ;;
+    /merge)         merge_run "$arg" ;;
+    /trees)         list_trees ;;
+    /clean)         clean_all "$arg" ;;
+    /update)        self_update; note "restart duo to use the new version" ;;
+    /doctor)        doctor ;;
+    /clear)         clear; banner ;;
+    /quit|/exit|/q) return 1 ;;
+    *)              fail "unknown command $cmd — try /help" ;;
+  esac
+  return 0
+}
+
+# ── REPL ────────────────────────────────────────────────────────────────────
+repl() {
+  local line rc PROMPT HIST="$CFG_DIR/history"
+  banner
+  mkdir -p "$CFG_DIR"; touch "$HIST"
+  set -o history; history -r "$HIST" 2>/dev/null
+  PROMPT=$'\001'"$BOLD$MAG"$'\002''duo'$'\001'"$RST$DIM"$'\002'' › '$'\001'"$RST"$'\002'
+  while :; do
+    trap ':' INT
+    IFS= read -e -r -p "$PROMPT" line; rc=$?
+    trap - INT
+    if (( rc > 128 )); then echo; continue; fi
+    if (( rc != 0 )); then echo; break; fi
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    if [[ -z "$line" ]]; then continue; fi
+    history -s "$line"; history -w "$HIST" 2>/dev/null
+    if [[ "$line" == /* ]]; then
+      slash "$line" || break
+    else
+      run_task "$line"
+      echo
+    fi
+  done
+  note "bye"
+}
+
+# ── self-update & doctor ────────────────────────────────────────────────────
+script_path() {
+  local src dir
+  src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="$dir/$src"
+  done
+  echo "$(cd -P "$(dirname "$src")" && pwd)/$(basename "$src")"
+}
+
+self_update() {
+  local p dir
+  p="$(script_path)"; dir="$(dirname "$(dirname "$p")")"
+  case "$p" in
+    */.bun/*)
+      printf '  %s…%s bun add -g %s@latest\n' "$CYN" "$RST" "$PKG"
+      bun add -g "$PKG@latest" >/dev/null && ok "now on $(duo --version)" ;;
+    */node_modules/*)
+      printf '  %s…%s npm install -g %s@latest\n' "$CYN" "$RST" "$PKG"
+      npm install -g "$PKG@latest" >/dev/null && ok "now on $(duo --version)" ;;
+    *)
+      if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+        printf '  %s…%s git pull in %s\n' "$CYN" "$RST" "$dir"
+        git -C "$dir" pull --ff-only -q && ok "now on $(bash "$p" --version) ($(git -C "$dir" log -1 --format=%h))"
+      else
+        fail "don't know how duo was installed ($p) — reinstall: npm install -g $PKG"; return 1
+      fi ;;
+  esac
+}
+
+doctor() {
+  local bad=0 t v
+  echo
+  printf '  %sduo %s%s  %s%s%s\n\n' "$BOLD" "$VERSION" "$RST" "$DIM" "$(script_path)" "$RST"
+  for t in git jq claude codex; do
+    if command -v "$t" >/dev/null 2>&1; then
+      ok "$t  ${DIM}$(command -v "$t")${RST}"
+    else
+      bad=1
+      case "$t" in
+        jq)     fail "jq missing — brew install jq" ;;
+        git)    fail "git missing — xcode-select --install" ;;
+        claude) if [[ -x "$HOME/.claude/local/claude" ]]; then
+                  fail "claude is only a shell alias, which scripts can't see — fix:"
+                  note "  mkdir -p ~/.local/bin && ln -sf ~/.claude/local/claude ~/.local/bin/claude"
+                else
+                  fail "claude missing — npm install -g @anthropic-ai/claude-code, then run claude once to log in"
+                fi ;;
+        codex)  fail "codex missing — npm install -g @openai/codex, then codex login" ;;
+      esac
+    fi
+  done
+  if command -v codex >/dev/null 2>&1; then
+    if codex exec --help 2>/dev/null | grep -q -- '--sandbox'; then ok "codex supports --sandbox"
+    else bad=1; fail "codex is too old (no --sandbox) — npm install -g @openai/codex@latest"; fi
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    if claude --help 2>/dev/null | grep -q -- '--permission-mode'; then ok "claude supports --permission-mode"
+    else bad=1; fail "claude is too old — update Claude Code"; fi
+  fi
+  v="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [[ -n "$v" ]]; then ok "in git repo ${DIM}$v${RST}"; else note "not in a git repo (cd into one to run duo)"; fi
+  echo
+  if (( bad )); then warn "fix the ✗ items, then run duo doctor again"; return 1; fi
+  ok "ready — type duo inside a git repo"; echo
+}
+
+# ── main ────────────────────────────────────────────────────────────────────
+main() {
+  local t
+  case "${1:-}" in
+    --update|update) self_update; exit $? ;;
+    doctor|--doctor) doctor; exit $? ;;
+    -v|--version) echo "duo $VERSION"; exit 0 ;;
+  esac
+  for t in git jq claude codex; do
+    if ! command -v "$t" >/dev/null 2>&1; then fail "$t not found — run: duo doctor"; exit 1; fi
+  done
+  ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { fail "not inside a git repo"; exit 1; }
+  REPO="$(basename "$ROOT")"
+  REPO_CFG="$ROOT/.duo/config"
+  mkdir -p "$ROOT/.duo"
+  EXCL="$(git -C "$ROOT" rev-parse --git-common-dir)/info/exclude"
+  case "$EXCL" in /*) ;; *) EXCL="$ROOT/$EXCL" ;; esac
+  grep -qxF '.duo*' "$EXCL" 2>/dev/null || echo '.duo*' >> "$EXCL"
+
+  set_defaults
+  load_cfg "$GLOBAL_CFG"
+  load_cfg "$REPO_CFG"
+  env_overrides
+
+  case "${1:-}" in
+    "")           repl ;;
+    -h|--help)    help ;;
+    -v|--version) echo "duo $VERSION" ;;
+    /*)           slash "$*" ;;
+    *)            banner; run_task "$*" ;;
+  esac
+}
+
+main "$@"
